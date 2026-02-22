@@ -247,6 +247,284 @@ def run_local_scoring(
         return {}, {}
 
 
+# ─── Classical CV Analysis ────────────────────────────────────────────────────
+
+def watershed_refine(seg_img: Image.Image) -> tuple[np.ndarray, np.ndarray]:
+    """Apply watershed to split touching nuclei in the Seg mask.
+    Returns (labels, refined_rgb) where labels is the watershed label map
+    and refined_rgb is a colorized display image."""
+    seg_rgb = np.array(seg_img.convert("RGB"))
+    h, w = seg_rgb.shape[:2]
+
+    red_mask = seg_rgb[:, :, 0] > 128
+    blue_mask = seg_rgb[:, :, 2] > 128
+    green_mask = seg_rgb[:, :, 1] > 128
+    # Cell pixels: red or blue, but not white (all channels high)
+    binary = ((red_mask | blue_mask) & ~(red_mask & blue_mask & green_mask)).astype(np.uint8) * 255
+
+    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
+
+    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
+    max_val = dist.max()
+    if max_val == 0:
+        return np.zeros((h, w), dtype=np.int32), np.zeros((h, w, 3), dtype=np.uint8)
+
+    _, sure_fg = cv2.threshold(dist, 0.4 * max_val, 255, cv2.THRESH_BINARY)
+    sure_fg = sure_fg.astype(np.uint8)
+    sure_bg = cv2.dilate(binary, kernel, iterations=3)
+    unknown = cv2.subtract(sure_bg, sure_fg)
+
+    _, markers = cv2.connectedComponents(sure_fg)
+    markers = markers + 1
+    markers[unknown == 255] = 0
+
+    markers = cv2.watershed(cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR), markers)
+    markers[markers == -1] = 0
+    markers[markers == 1] = 0  # background label
+
+    refined_rgb = np.zeros((h, w, 3), dtype=np.uint8)
+    for label_id in range(2, markers.max() + 1):
+        mask_i = markers == label_id
+        if not np.any(mask_i):
+            continue
+        red_count = np.sum(seg_rgb[mask_i, 0] > 128)
+        blue_count = np.sum(seg_rgb[mask_i, 2] > 128)
+        if red_count >= blue_count:
+            refined_rgb[mask_i] = [255, 80, 80]
+        else:
+            refined_rgb[mask_i] = [80, 80, 255]
+
+    return markers, refined_rgb
+
+
+def compute_morphometry(labels: np.ndarray) -> tuple[list[dict], dict]:
+    """Compute per-cell morphometric features from a watershed label map.
+    Returns (cells_list, summary_dict)."""
+    cells = []
+    unique_labels = [int(l) for l in np.unique(labels) if l > 0]
+
+    for lab in unique_labels:
+        mask_u8 = (labels == lab).astype(np.uint8) * 255
+        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+        if not contours:
+            continue
+        cnt = max(contours, key=cv2.contourArea)
+        area = cv2.contourArea(cnt)
+        if area < 5:
+            continue
+        perimeter = cv2.arcLength(cnt, True)
+        circularity = (4 * np.pi * area / (perimeter ** 2)) if perimeter > 0 else 0.0
+
+        eccentricity = 0.0
+        if len(cnt) >= 5:
+            (_, _), (ma, MA), _ = cv2.fitEllipse(cnt)
+            a, b = max(ma, MA), min(ma, MA)
+            if a > 0:
+                eccentricity = np.sqrt(max(0, 1 - (b / a) ** 2))
+
+        M = cv2.moments(cnt)
+        cx = int(M["m10"] / M["m00"]) if M["m00"] > 0 else 0
+        cy = int(M["m01"] / M["m00"]) if M["m00"] > 0 else 0
+
+        cells.append({
+            "label": lab,
+            "area": int(area),
+            "perimeter": round(perimeter, 2),
+            "circularity": round(min(circularity, 1.0), 4),
+            "eccentricity": round(eccentricity, 4),
+            "centroid": (cy, cx),
+        })
+
+    areas = [c["area"] for c in cells]
+    circs = [c["circularity"] for c in cells]
+    eccs = [c["eccentricity"] for c in cells]
+
+    summary = {
+        "total_cells_morpho": len(cells),
+        "mean_area": round(float(np.mean(areas)), 2) if areas else 0,
+        "median_area": round(float(np.median(areas)), 2) if areas else 0,
+        "std_area": round(float(np.std(areas)), 2) if areas else 0,
+        "mean_circularity": round(float(np.mean(circs)), 4) if circs else 0,
+        "mean_eccentricity": round(float(np.mean(eccs)), 4) if eccs else 0,
+    }
+    return cells, summary
+
+
+def build_spatial_heatmap(
+    seg_img: Image.Image,
+    orig_img: Image.Image,
+    labels: np.ndarray,
+    alpha: float = 0.5,
+    blur_ksize: int = 51,
+) -> np.ndarray:
+    """Create a density heatmap of positive cell locations overlaid on the original."""
+    seg_rgb = np.array(seg_img.convert("RGB"))
+    h, w = seg_rgb.shape[:2]
+
+    point_map = np.zeros((h, w), dtype=np.float32)
+
+    for lab in np.unique(labels):
+        if lab <= 0:
+            continue
+        mask_i = labels == lab
+        red_count = np.sum(seg_rgb[mask_i, 0] > 128)
+        blue_count = np.sum(seg_rgb[mask_i, 2] > 128)
+        if red_count < blue_count:
+            continue  # negative cell
+        ys, xs = np.where(mask_i)
+        cy, cx = int(np.mean(ys)), int(np.mean(xs))
+        if 0 <= cy < h and 0 <= cx < w:
+            point_map[cy, cx] += 1.0
+
+    ksize = blur_ksize if blur_ksize % 2 == 1 else blur_ksize + 1
+    density = cv2.GaussianBlur(point_map, (ksize, ksize), 0)
+
+    if density.max() > 0:
+        density = (density / density.max() * 255).astype(np.uint8)
+    else:
+        density = density.astype(np.uint8)
+
+    heatmap_bgr = cv2.applyColorMap(density, cv2.COLORMAP_JET)
+    heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
+
+    orig_arr = np.array(orig_img.convert("RGB").resize((w, h)))
+    mask = density > 5
+    overlay = orig_arr.copy()
+    overlay[mask] = (
+        (1 - alpha) * orig_arr[mask].astype(np.float32)
+        + alpha * heatmap_rgb[mask].astype(np.float32)
+    ).astype(np.uint8)
+
+    return overlay
+
+
+def compute_hscore(
+    labels: np.ndarray,
+    seg_img: Image.Image,
+    marker_img: Image.Image,
+) -> tuple[dict, list[dict]]:
+    """Compute H-score from per-cell Marker channel intensity.
+    Bins: 0 (<50), 1+ (50-100), 2+ (100-175), 3+ (175-255).
+    H-score = (1*count_1+ + 2*count_2+ + 3*count_3+) / total * 100, range 0-300."""
+    marker_gray = np.array(marker_img.convert("L"))
+
+    bins = {"0": 0, "1+": 0, "2+": 0, "3+": 0}
+    cell_intensities = []
+    total_cells = 0
+
+    for lab in np.unique(labels):
+        if lab <= 0:
+            continue
+        mask_i = labels == lab
+        mean_intensity = float(np.mean(marker_gray[mask_i]))
+        total_cells += 1
+
+        if mean_intensity < 50:
+            bin_label = "0"
+        elif mean_intensity < 100:
+            bin_label = "1+"
+        elif mean_intensity < 175:
+            bin_label = "2+"
+        else:
+            bin_label = "3+"
+
+        bins[bin_label] += 1
+        cell_intensities.append({
+            "label": int(lab),
+            "mean_intensity": round(mean_intensity, 2),
+            "bin": bin_label,
+        })
+
+    raw_hscore = 1 * bins["1+"] + 2 * bins["2+"] + 3 * bins["3+"]
+    normalized = round(raw_hscore / total_cells * 100, 1) if total_cells > 0 else 0
+
+    summary = {
+        "h_score": normalized,
+        "h_score_raw": raw_hscore,
+        "count_0_negative": bins["0"],
+        "count_1plus_weak": bins["1+"],
+        "count_2plus_moderate": bins["2+"],
+        "count_3plus_strong": bins["3+"],
+        "total_scored": total_cells,
+        "pct_0": round(bins["0"] / total_cells * 100, 1) if total_cells else 0,
+        "pct_1plus": round(bins["1+"] / total_cells * 100, 1) if total_cells else 0,
+        "pct_2plus": round(bins["2+"] / total_cells * 100, 1) if total_cells else 0,
+        "pct_3plus": round(bins["3+"] / total_cells * 100, 1) if total_cells else 0,
+    }
+    return summary, cell_intensities
+
+
+def run_classical_analysis(
+    orig_img: Image.Image,
+    decoded: dict[str, Image.Image],
+) -> tuple[dict, dict[str, Image.Image]]:
+    """Run all classical CV analysis: watershed, morphometry, heatmap, H-score.
+    Works without the deepliif library — only needs Seg + Marker images from the API."""
+    seg = decoded.get("Seg") or decoded.get("seg")
+    if seg is None:
+        return {}, {}
+
+    marker = decoded.get("Marker") or decoded.get("marker")
+    analysis: dict = {}
+    extra_images: dict[str, Image.Image] = {}
+
+    # 1. Watershed refinement
+    labels = None
+    try:
+        labels, refined_rgb = watershed_refine(seg)
+        extra_images["Watershed"] = Image.fromarray(refined_rgb)
+
+        seg_rgb = np.array(seg.convert("RGB"))
+        unique = [l for l in np.unique(labels) if l > 0]
+        pos_count = sum(
+            1 for l in unique
+            if np.sum(seg_rgb[labels == l, 0] > 128) >= np.sum(seg_rgb[labels == l, 2] > 128)
+        )
+        neg_count = len(unique) - pos_count
+        analysis["watershed"] = {
+            "num_total": len(unique),
+            "num_pos": pos_count,
+            "num_neg": neg_count,
+            "percent_pos": round(pos_count / len(unique) * 100, 2) if unique else 0,
+        }
+    except Exception:
+        analysis["watershed"] = {}
+
+    # 2. Morphometry
+    if labels is not None:
+        try:
+            morph_cells, morph_summary = compute_morphometry(labels)
+            analysis["morphometry"] = {"summary": morph_summary, "cells": morph_cells}
+        except Exception:
+            analysis["morphometry"] = {}
+    else:
+        analysis["morphometry"] = {}
+
+    # 3. Spatial heatmap
+    if labels is not None:
+        try:
+            heatmap_arr = build_spatial_heatmap(seg, orig_img, labels)
+            extra_images["Heatmap"] = Image.fromarray(heatmap_arr)
+            analysis["heatmap_generated"] = True
+        except Exception:
+            analysis["heatmap_generated"] = False
+    else:
+        analysis["heatmap_generated"] = False
+
+    # 4. H-score
+    if labels is not None and marker is not None:
+        try:
+            hscore_summary, cell_intensities = compute_hscore(labels, seg, marker)
+            analysis["hscore"] = {"summary": hscore_summary, "cell_intensities": cell_intensities}
+        except Exception:
+            analysis["hscore"] = {}
+    else:
+        analysis["hscore"] = {}
+
+    return analysis, extra_images
+
+
 def run_video_frame_scoring(
     frame_img: Image.Image,
     decoded: dict,
@@ -420,6 +698,31 @@ def build_zip(all_results: dict) -> io.BytesIO:
                 f"{name}/scoring.json",
                 json.dumps(res["scoring"], indent=2),
             )
+            # Classical CV analysis JSONs
+            analysis = res.get("_analysis", {})
+            if analysis:
+                summary_out = {
+                    "watershed": analysis.get("watershed", {}),
+                    "morphometry_summary": analysis.get("morphometry", {}).get("summary", {}),
+                    "hscore": analysis.get("hscore", {}).get("summary", {}),
+                    "heatmap_generated": analysis.get("heatmap_generated", False),
+                }
+                zf.writestr(
+                    f"{name}/cv_analysis.json",
+                    json.dumps(summary_out, indent=2),
+                )
+                morph_cells = analysis.get("morphometry", {}).get("cells", [])
+                if morph_cells:
+                    zf.writestr(
+                        f"{name}/morphometry_cells.json",
+                        json.dumps(morph_cells, indent=2),
+                    )
+                hscore_cells = analysis.get("hscore", {}).get("cell_intensities", [])
+                if hscore_cells:
+                    zf.writestr(
+                        f"{name}/hscore_cells.json",
+                        json.dumps(hscore_cells, indent=2),
+                    )
     buf.seek(0)
     return buf
 
@@ -455,6 +758,11 @@ with st.sidebar:
     use_pil = st.checkbox(
         "Pillow loader (faster, PNG/JPG only)",
         help="Uncheck to use Bio-Formats for TIF/WSI",
+    )
+    run_cv_analysis = st.checkbox(
+        "Classical CV analysis",
+        value=True,
+        help="Watershed refinement, morphometry, spatial heatmap, and H-score (OpenCV-based, no deepliif dependency)",
     )
 
 
@@ -542,10 +850,15 @@ if uploaded:
                     if local_sc:
                         sc = local_sc
                         sc_key_found = True
+                    cv_analysis = {}
+                    if run_cv_analysis:
+                        cv_analysis, cv_extras = run_classical_analysis(frame_img, decoded_imgs)
+                        decoded_imgs.update(cv_extras)
                     all_results[fname] = {
                         "images": decoded_imgs,
                         "scoring": sc,
                         "_cells": frame_cells,
+                        "_analysis": cv_analysis,
                         "_raw_keys": raw_keys,
                         "_sc_key_found": sc_key_found,
                     }
@@ -580,9 +893,14 @@ if uploaded:
                         sc = local_sc
                         sc_key_found = True
                         decoded_imgs.update(extras)
+                    cv_analysis = {}
+                    if run_cv_analysis:
+                        cv_analysis, cv_extras = run_classical_analysis(page_img, decoded_imgs)
+                        decoded_imgs.update(cv_extras)
                     all_results[fname] = {
                         "images": decoded_imgs,
                         "scoring": sc,
+                        "_analysis": cv_analysis,
                         "_raw_keys": raw_keys,
                         "_sc_key_found": sc_key_found,
                     }
@@ -612,9 +930,14 @@ if uploaded:
                         sc = local_sc
                         sc_key_found = True
                         decoded_imgs.update(extras)
+                    cv_analysis = {}
+                    if run_cv_analysis:
+                        cv_analysis, cv_extras = run_classical_analysis(src_img, decoded_imgs)
+                        decoded_imgs.update(cv_extras)
                     all_results["result"] = {
                         "images": decoded_imgs,
                         "scoring": sc,
+                        "_analysis": cv_analysis,
                         "_raw_keys": raw_keys,
                         "_sc_key_found": sc_key_found,
                     }
@@ -691,6 +1014,20 @@ if "_results" in st.session_state:
                 zf.writestr(f"{ch}.mp4", vdata["bytes"])
             if _deduped:
                 zf.writestr("scoring_summary.json", json.dumps(_deduped, indent=2))
+            # Aggregate classical analysis across frames
+            _frame_analyses = [r.get("_analysis", {}) for r in _all.values() if r.get("_analysis")]
+            if _frame_analyses:
+                _ws_t = sum(a.get("watershed", {}).get("num_total", 0) for a in _frame_analyses)
+                _ws_p = sum(a.get("watershed", {}).get("num_pos", 0) for a in _frame_analyses)
+                _hs_vals = [a.get("hscore", {}).get("summary", {}).get("h_score") for a in _frame_analyses]
+                _hs_vals = [h for h in _hs_vals if h is not None]
+                cv_agg = {
+                    "watershed_total": _ws_t,
+                    "watershed_pos": _ws_p,
+                    "watershed_neg": _ws_t - _ws_p,
+                    "avg_h_score": round(float(np.mean(_hs_vals)), 1) if _hs_vals else None,
+                }
+                zf.writestr("cv_analysis_summary.json", json.dumps(cv_agg, indent=2))
         all_zip.seek(0)
         st.download_button(
             "Download all channels (.zip)",
@@ -728,6 +1065,41 @@ if "_results" in st.session_state:
                 m2.metric("Positive Cells", agg_pos)
                 m3.metric("Negative Cells", agg_neg)
                 m4.metric("% Positive",     f"{agg_pct}%")
+
+        # ── Classical CV analysis (aggregated across video frames) ──────────
+        frame_analyses = [r.get("_analysis", {}) for r in _all.values() if r.get("_analysis")]
+        if frame_analyses:
+            st.markdown("---")
+            st.subheader("Classical CV Analysis (across frames)")
+
+            ws_totals = [a.get("watershed", {}).get("num_total", 0) for a in frame_analyses]
+            ws_pos = [a.get("watershed", {}).get("num_pos", 0) for a in frame_analyses]
+            if sum(ws_totals) > 0:
+                total_ws = sum(ws_totals)
+                total_pos_ws = sum(ws_pos)
+                st.caption("Watershed-refined counts (per-frame sum)")
+                aw1, aw2, aw3, aw4 = st.columns(4)
+                aw1.metric("Total (watershed)", total_ws)
+                aw2.metric("Positive", total_pos_ws)
+                aw3.metric("Negative", total_ws - total_pos_ws)
+                aw4.metric("% Positive", f"{round(total_pos_ws / total_ws * 100, 2)}%")
+
+            hscores = [
+                a.get("hscore", {}).get("summary", {}).get("h_score", None)
+                for a in frame_analyses
+            ]
+            hscores = [h for h in hscores if h is not None]
+            if hscores:
+                st.metric("Average H-Score across frames", round(float(np.mean(hscores)), 1))
+
+            morph_summaries = [a.get("morphometry", {}).get("summary", {}) for a in frame_analyses]
+            mean_areas = [m.get("mean_area", 0) for m in morph_summaries if m.get("mean_area")]
+            if mean_areas:
+                mc1, mc2 = st.columns(2)
+                mc1.metric("Avg Mean Cell Area (px)", round(float(np.mean(mean_areas)), 2))
+                mean_circs = [m.get("mean_circularity", 0) for m in morph_summaries if m.get("mean_circularity")]
+                if mean_circs:
+                    mc2.metric("Avg Mean Circularity", round(float(np.mean(mean_circs)), 4))
 
         st.subheader("Output channels")
         for ch, vdata in _vmap.items():
@@ -791,6 +1163,64 @@ if "_results" in st.session_state:
                             f"No scoring key found in the API response. "
                             f"Top-level keys returned: `{raw_keys}`."
                         )
+
+                # ── Classical CV Analysis ──────────────────────────────────
+                analysis = res.get("_analysis", {})
+                if analysis:
+                    st.markdown("---")
+
+                    ws = analysis.get("watershed", {})
+                    if ws and ws.get("num_total", 0) > 0:
+                        st.subheader("Watershed-Refined Cell Counts")
+                        w1, w2, w3, w4 = st.columns(4)
+                        w1.metric("Total (watershed)", ws["num_total"])
+                        w2.metric("Positive", ws["num_pos"])
+                        w3.metric("Negative", ws["num_neg"])
+                        w4.metric("% Positive", f"{ws['percent_pos']}%")
+
+                    hs = analysis.get("hscore", {}).get("summary", {})
+                    if hs:
+                        st.subheader("H-Score")
+                        h1, h2, h3, h4, h5 = st.columns(5)
+                        h1.metric("H-Score", hs["h_score"])
+                        h2.metric("Negative (0)", f"{hs['count_0_negative']} ({hs['pct_0']}%)")
+                        h3.metric("Weak (1+)", f"{hs['count_1plus_weak']} ({hs['pct_1plus']}%)")
+                        h4.metric("Moderate (2+)", f"{hs['count_2plus_moderate']} ({hs['pct_2plus']}%)")
+                        h5.metric("Strong (3+)", f"{hs['count_3plus_strong']} ({hs['pct_3plus']}%)")
+
+                    morph = analysis.get("morphometry", {})
+                    morph_summary = morph.get("summary", {})
+                    morph_cells = morph.get("cells", [])
+                    if morph_summary and morph_cells:
+                        st.subheader("Cell Morphometry")
+                        mc1, mc2, mc3, mc4 = st.columns(4)
+                        mc1.metric("Mean Area (px)", morph_summary["mean_area"])
+                        mc2.metric("Median Area (px)", morph_summary["median_area"])
+                        mc3.metric("Std Area", morph_summary["std_area"])
+                        mc4.metric("Mean Circularity", morph_summary["mean_circularity"])
+
+                        areas = [c["area"] for c in morph_cells]
+                        if areas:
+                            bin_count = min(20, max(5, len(areas) // 10))
+                            bin_edges = np.linspace(min(areas), max(areas) + 1, bin_count + 1)
+                            hist_vals = np.histogram(areas, bins=bin_edges)[0]
+                            chart_data = {
+                                f"{int(bin_edges[i])}-{int(bin_edges[i+1])}": int(hist_vals[i])
+                                for i in range(bin_count)
+                            }
+                            st.caption("Cell Area Distribution (px)")
+                            st.bar_chart(chart_data)
+
+                        circs = [c["circularity"] for c in morph_cells]
+                        if circs:
+                            circ_bins = np.linspace(0, 1.0, 11)
+                            circ_hist = np.histogram(circs, bins=circ_bins)[0]
+                            circ_chart = {
+                                f"{circ_bins[i]:.1f}-{circ_bins[i+1]:.1f}": int(circ_hist[i])
+                                for i in range(10)
+                            }
+                            st.caption("Circularity Distribution")
+                            st.bar_chart(circ_chart)
 
                 imgs = res["images"]
                 if imgs:
