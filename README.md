@@ -1,6 +1,6 @@
-# DeepLIIF Pipeline
+# TuroQuant Pipeline
 
-A Streamlit web application for IHC (Immunohistochemistry) image quantification using the [DeepLIIF](https://github.com/nadeemlab/DeepLIIF) API and local postprocessing library.
+A Streamlit web application for IHC (Immunohistochemistry) image quantification using the TuroQuant API and local postprocessing library.
 
 Upload an IHC image, multi-page TIF, or video scan of a whole-slide image (WSI) and get:
 - Multiplex immunofluorescence channel decomposition (DAPI, Hematoxylin, Lap2, Marker, Seg)
@@ -20,7 +20,7 @@ Upload an IHC image, multi-page TIF, or video scan of a whole-slide image (WSI) 
 ### Prerequisites
 
 - Python 3.10+
-- Internet connection (for the DeepLIIF inference API at `deepliif.org`)
+- Internet connection (for the TuroQuant inference API)
 
 ### Installation
 
@@ -53,7 +53,7 @@ The app opens at `http://localhost:8501`.
    - **Slim mode** — return only the segmentation image.
    - **Skip postprocessing** — bypass server-side postprocessing (useful if the server returns HTTP 500).
    - **Pillow loader** — use PIL instead of Bio-Formats for loading (faster for PNG/JPG).
-3. **Click "Run DeepLIIF"** to send the image to the API and run local cell counting.
+3. **Click "Run TuroQuant"** to send the image to the API and run local cell counting.
 4. **View results**:
    - Channel images (DAPI, Hema, Lap2, Marker, Seg, Overlay, Refined)
    - Cell count metrics: Total Cells, Positive, Negative, % Positive, Pos:Neg ratio
@@ -68,7 +68,7 @@ The app opens at `http://localhost:8501`.
 
 ### Single Image / TIF
 
-The app sends the image to the DeepLIIF API which returns channel-decomposed images. It then runs `deepliif.postprocessing.compute_final_results` locally using the **Seg** (segmentation) and **Marker** images to detect and classify individual cells:
+The app sends the image to the TuroQuant API which returns channel-decomposed images. It then runs local postprocessing using the **Seg** (segmentation) and **Marker** images to detect and classify individual cells:
 - **Red cells** in the Seg image = positive (protein-expressing)
 - **Blue cells** in the Seg image = negative
 
@@ -97,9 +97,8 @@ Deep-Liif/
 
 ## API Reference
 
-This app uses the public DeepLIIF inference API:
+This app uses the TuroQuant inference API:
 - Endpoint: `https://deepliif.org/api/infer`
-- Documentation: [DeepLIIF GitHub](https://github.com/nadeemlab/DeepLIIF)
 
 ## License
 

@@ -113,14 +113,14 @@ def tif_pages(tif_bytes: bytes) -> list[Image.Image]:
     return pages
 
 
-MAX_DIM = 3000  # DeepLIIF API upper limit
+MAX_DIM = 3000  # TuroQuant API upper limit
 
 # Minimum tile size per resolution — smaller images cause a server 500
 MIN_DIM = {"40x": 512, "20x": 256, "10x": 128}
 
 
 def prepare_image(img: Image.Image, resolution: str) -> tuple[Image.Image, list[str]]:
-    """Resize/pad image to satisfy DeepLIIF size constraints. Returns (img, warnings)."""
+    """Resize/pad image to satisfy TuroQuant size constraints. Returns (img, warnings)."""
     img = img.convert("RGB")
     notes = []
     min_dim = MIN_DIM.get(resolution, 512)
@@ -194,7 +194,7 @@ def decode_result_images(raw: dict) -> dict[str, Image.Image]:
 
 def extract_scoring(raw: dict) -> tuple[dict, list[str], bool]:
     """Return (scoring_dict, all_non_image_keys_from_raw, key_found).
-    Tries several key names the DeepLIIF API might use."""
+    Tries several key names the TuroQuant API might use."""
     non_image_keys = [k for k in raw if k != "images"]
     for key in ("scoring", "scores", "cell_scoring", "score", "results"):
         if key in raw:
@@ -208,7 +208,7 @@ def run_local_scoring(
     decoded: dict,
     resolution: str,
 ) -> tuple[dict, dict]:
-    """Run DeepLIIF postprocessing locally to count positive/negative cells.
+    """Run TuroQuant postprocessing locally to count positive/negative cells.
 
     Uses the Seg + Marker images returned by the API together with the
     original (prepared) image.  Returns:
@@ -426,13 +426,13 @@ def build_zip(all_results: dict) -> io.BytesIO:
 
 # ─── UI ──────────────────────────────────────────────────────────────────────
 
-st.set_page_config(page_title="DeepLIIF Pipeline", layout="wide")
-st.title("DeepLIIF Pipeline")
-st.caption("IHC image quantification via DeepLIIF · supports video & multi-page TIF")
+st.set_page_config(page_title="TuroQuant Pipeline", layout="wide")
+st.title("TuroQuant Pipeline")
+st.caption("IHC image quantification via TuroQuant · supports video & multi-page TIF")
 
 # --- Sidebar: options ---------------------------------------------------------
 with st.sidebar:
-    st.header("DeepLIIF Options")
+    st.header("TuroQuant Options")
 
     resolution = st.selectbox(
         "Scan Resolution",
@@ -488,7 +488,7 @@ if uploaded:
         )
         api_delay = st.slider(
             "Delay between API calls (s)", 0.0, 5.0, 1.0, 0.5,
-            help="Pause between frames to avoid overloading the DeepLIIF server",
+            help="Pause between frames to avoid overloading the TuroQuant server",
         )
 
     # Build API param dict — match official API spec exactly
@@ -504,15 +504,15 @@ if uploaded:
     if use_pil:
         api_params["pil"] = "true"
 
-    if st.button("Run DeepLIIF", type="primary"):
+    if st.button("Run TuroQuant", type="primary"):
         # Quick server reachability check
         try:
             ping = requests.get("https://deepliif.org", timeout=10)
             if ping.status_code >= 500:
-                st.error("deepliif.org is returning server errors right now. Try again later.")
+                st.error("TuroQuant server is returning errors right now. Try again later.")
                 st.stop()
         except Exception:
-            st.error("Cannot reach deepliif.org. Check your internet connection.")
+            st.error("Cannot reach TuroQuant server. Check your internet connection.")
             st.stop()
 
         raw_bytes = uploaded.read()
@@ -695,7 +695,7 @@ if "_results" in st.session_state:
         st.download_button(
             "Download all channels (.zip)",
             all_zip,
-            file_name="deepliif_all_channels.zip",
+            file_name="turoquant_all_channels.zip",
             mime="application/zip",
             key="dl_all_zip",
         )
@@ -748,7 +748,7 @@ if "_results" in st.session_state:
         st.download_button(
             label="Download all frames (.zip)",
             data=zip_buf,
-            file_name="deepliif_frames.zip",
+            file_name="turoquant_frames.zip",
             mime="application/zip",
             key="dl_frames",
         )
@@ -759,7 +759,7 @@ if "_results" in st.session_state:
             with st.expander(name, expanded=(len(_all) == 1)):
                 sc = res["scoring"]
                 if sc and "num_total" in sc:
-                    # Local deepliif scoring (full detail)
+                    # Local TuroQuant scoring (full detail)
                     pct = sc.get("percent_pos", 0)
                     pct_str = f"{round(pct, 2)}%" if isinstance(pct, (int, float)) else str(pct)
                     ratio = (
@@ -802,6 +802,6 @@ if "_results" in st.session_state:
         st.download_button(
             label="Download all results (.zip)",
             data=zip_buf,
-            file_name="deepliif_results.zip",
+            file_name="turoquant_results.zip",
             mime="application/zip",
         )
