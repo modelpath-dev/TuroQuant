@@ -13,5 +13,3 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
-# Sample data (large files)
-sample_data/
