@@ -1,35 +1,27 @@
 import streamlit as st
-import requests
-import base64
-import json
-import zipfile
 import io
-import tempfile
+import json
 import os
+import tempfile
 import time
+import zipfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 import cv2
 import numpy as np
 import tifffile
 from PIL import Image
 
-try:
-    from deepliif.postprocessing import compute_final_results as _deepliif_compute
-    from deepliif.postprocessing import compute_cell_results as _deepliif_cell_results
-    from deepliif.postprocessing import cells_to_final_results as _deepliif_cells_to_final
-    _DEEPLIIF_PP = True
-except ImportError:
-    _DEEPLIIF_PP = False
-
-# ─── Exceptions ──────────────────────────────────────────────────────────────
-
-class PostprocessingError(RuntimeError):
-    pass
+# ─── Segmentation API — the only import from segmentation.py ─────────────────
+from segmentation import (
+    segment,
+    segment_video_frame,
+    check_server,
+    PostprocessingError,
+)
 
 
 # ─── Constants ───────────────────────────────────────────────────────────────
-
-DEEPLIIF_API = "https://deepliif.org/api/infer"
 
 IMAGE_FORMATS = [
     "png", "jpg", "jpeg",
@@ -44,7 +36,6 @@ VIDEO_FORMATS = ["mp4", "avi", "mov", "mkv", "webm"]
 
 ALL_FORMATS = IMAGE_FORMATS + VIDEO_FORMATS
 
-# Human-readable labels for the format dropdown shown to users
 FORMAT_LABELS = {
     "png":    "PNG – Portable Network Graphics",
     "jpg":    "JPG/JPEG – Joint Photographic Experts Group",
@@ -113,471 +104,49 @@ def tif_pages(tif_bytes: bytes) -> list[Image.Image]:
     return pages
 
 
-MAX_DIM = 3000  # TuroQuant API upper limit
-
-# Minimum tile size per resolution — smaller images cause a server 500
-MIN_DIM = {"40x": 512, "20x": 256, "10x": 128}
-
-
-def prepare_image(img: Image.Image, resolution: str) -> tuple[Image.Image, list[str]]:
-    """Resize/pad image to satisfy TuroQuant size constraints. Returns (img, warnings)."""
-    img = img.convert("RGB")
-    notes = []
-    min_dim = MIN_DIM.get(resolution, 512)
-
-    # Scale down if too large
-    if img.width > MAX_DIM or img.height > MAX_DIM:
-        ratio = min(MAX_DIM / img.width, MAX_DIM / img.height)
-        img = img.resize((int(img.width * ratio), int(img.height * ratio)), Image.LANCZOS)
-        notes.append(f"scaled down to {img.width}×{img.height}")
-
-    # Pad up if too small
-    if img.width < min_dim or img.height < min_dim:
-        new_w = max(img.width, min_dim)
-        new_h = max(img.height, min_dim)
-        padded = Image.new("RGB", (new_w, new_h), (255, 255, 255))
-        padded.paste(img, (0, 0))
-        img = padded
-        notes.append(f"padded to {new_w}×{new_h} (min tile={min_dim})")
-
-    return img, notes
-
-
-def image_to_png_bytes(img: Image.Image) -> bytes:
-    buf = io.BytesIO()
-    img.save(buf, format="PNG")
-    return buf.getvalue()
-
-
-def call_api(png_bytes: bytes, fname: str, params: dict, retries: int = 3) -> dict:
-    last_err = None
-    for attempt in range(retries):
-        try:
-            resp = requests.post(
-                DEEPLIIF_API,
-                files={"img": (fname, png_bytes, "image/png")},
-                params=params,
-                timeout=180,
-            )
-            if not resp.ok:
-                if resp.status_code == 500 and "nopost" not in params:
-                    raise PostprocessingError(
-                        "Server postprocessing failed (HTTP 500). "
-                        "Enable **Skip postprocessing** in the sidebar and click Run again."
-                    )
-                try:
-                    detail = resp.json()
-                except Exception:
-                    raw = resp.text[:300].strip()
-                    detail = "server returned an error page" if raw.startswith("<") else raw
-                if resp.status_code == 500:
-                    raise RuntimeError(
-                        "Server error (HTTP 500) — the server may be overloaded. Try again later."
-                    )
-                raise RuntimeError(f"HTTP {resp.status_code}: {detail}")
-            return resp.json()
-        except (RuntimeError, PostprocessingError):
-            raise  # don't retry on 4xx/5xx with a clear message
-        except Exception as e:
-            last_err = e
-            if attempt < retries - 1:
-                time.sleep(2 ** attempt)  # 1s, 2s backoff
-    raise RuntimeError(f"Failed after {retries} attempts: {last_err}")
-
-
-def decode_result_images(raw: dict) -> dict[str, Image.Image]:
-    out = {}
-    for key, b64 in raw.get("images", {}).items():
-        out[key] = Image.open(io.BytesIO(base64.b64decode(b64)))
+def interpolate_frames(frames: list, steps: int) -> list:
+    """Insert `steps` linearly blended frames between every consecutive pair."""
+    if steps == 0 or len(frames) < 2:
+        return frames
+    out = []
+    for i in range(len(frames) - 1):
+        out.append(frames[i])
+        a = np.array(frames[i].convert("RGB"), dtype=float)
+        b = np.array(frames[i + 1].convert("RGB"), dtype=float)
+        for s in range(1, steps + 1):
+            t = s / (steps + 1)
+            out.append(Image.fromarray(((1 - t) * a + t * b).astype(np.uint8)))
+    out.append(frames[-1])
     return out
 
 
-def extract_scoring(raw: dict) -> tuple[dict, list[str], bool]:
-    """Return (scoring_dict, all_non_image_keys_from_raw, key_found).
-    Tries several key names the TuroQuant API might use."""
-    non_image_keys = [k for k in raw if k != "images"]
-    for key in ("scoring", "scores", "cell_scoring", "score", "results"):
-        if key in raw:
-            sc = raw[key]
-            return (sc if isinstance(sc, dict) else {}), non_image_keys, True
-    return {}, non_image_keys, False
-
-
-def run_local_scoring(
-    orig_img: Image.Image,
-    decoded: dict,
-    resolution: str,
-) -> tuple[dict, dict]:
-    """Run TuroQuant postprocessing locally to count positive/negative cells.
-
-    Uses the Seg + Marker images returned by the API together with the
-    original (prepared) image.  Returns:
-        scoring  – dict with num_total, num_pos, num_neg, percent_pos, …
-        extras   – dict of additional PIL images (Overlay, Refined)
-    """
-    if not _DEEPLIIF_PP:
-        return {}, {}
-
-    # Accept both capitalisation styles ("Seg" / "seg")
-    seg = decoded.get("Seg") or decoded.get("seg")
-    if seg is None:
-        return {}, {}
-
-    marker = decoded.get("Marker") or decoded.get("marker")
-
+def frames_to_video(pil_frames: list, fps: float) -> bytes:
+    """Stitch a list of PIL images into an MP4 and return the bytes."""
+    if not pil_frames:
+        return b""
+    w, h = pil_frames[0].size
+    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
+    tmp.close()
     try:
-        overlay, refined, scoring = _deepliif_compute(
-            orig=orig_img.convert("RGB"),
-            seg=seg.convert("RGB"),
-            marker=marker.convert("RGB") if marker is not None else None,
-            resolution=resolution,
+        writer = cv2.VideoWriter(
+            tmp.name,
+            cv2.VideoWriter_fourcc(*"mp4v"),
+            float(fps),
+            (w, h),
         )
-        # compute_final_results returns numpy arrays — convert to PIL
-        def _to_pil(x):
-            if isinstance(x, Image.Image):
-                return x
-            arr = np.array(x)
-            if arr.dtype != np.uint8:
-                arr = np.clip(arr, 0, 255).astype(np.uint8)
-            return Image.fromarray(arr)
-
-        extras = {"Overlay": _to_pil(overlay), "Refined": _to_pil(refined)}
-        return scoring, extras
-    except Exception:
-        return {}, {}
-
-
-# ─── Classical CV Analysis ────────────────────────────────────────────────────
-
-def watershed_refine(seg_img: Image.Image) -> tuple[np.ndarray, np.ndarray]:
-    """Apply watershed to split touching nuclei in the Seg mask.
-    Returns (labels, refined_rgb) where labels is the watershed label map
-    and refined_rgb is a colorized display image."""
-    seg_rgb = np.array(seg_img.convert("RGB"))
-    h, w = seg_rgb.shape[:2]
-
-    red_mask = seg_rgb[:, :, 0] > 128
-    blue_mask = seg_rgb[:, :, 2] > 128
-    green_mask = seg_rgb[:, :, 1] > 128
-    # Cell pixels: red or blue, but not white (all channels high)
-    binary = ((red_mask | blue_mask) & ~(red_mask & blue_mask & green_mask)).astype(np.uint8) * 255
-
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    binary = cv2.morphologyEx(binary, cv2.MORPH_OPEN, kernel, iterations=2)
-
-    dist = cv2.distanceTransform(binary, cv2.DIST_L2, 5)
-    max_val = dist.max()
-    if max_val == 0:
-        return np.zeros((h, w), dtype=np.int32), np.zeros((h, w, 3), dtype=np.uint8)
-
-    _, sure_fg = cv2.threshold(dist, 0.4 * max_val, 255, cv2.THRESH_BINARY)
-    sure_fg = sure_fg.astype(np.uint8)
-    sure_bg = cv2.dilate(binary, kernel, iterations=3)
-    unknown = cv2.subtract(sure_bg, sure_fg)
-
-    _, markers = cv2.connectedComponents(sure_fg)
-    markers = markers + 1
-    markers[unknown == 255] = 0
-
-    markers = cv2.watershed(cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR), markers)
-    markers[markers == -1] = 0
-    markers[markers == 1] = 0  # background label
-
-    refined_rgb = np.zeros((h, w, 3), dtype=np.uint8)
-    for label_id in range(2, markers.max() + 1):
-        mask_i = markers == label_id
-        if not np.any(mask_i):
-            continue
-        red_count = np.sum(seg_rgb[mask_i, 0] > 128)
-        blue_count = np.sum(seg_rgb[mask_i, 2] > 128)
-        if red_count >= blue_count:
-            refined_rgb[mask_i] = [255, 80, 80]
-        else:
-            refined_rgb[mask_i] = [80, 80, 255]
-
-    return markers, refined_rgb
-
-
-def compute_morphometry(labels: np.ndarray) -> tuple[list[dict], dict]:
-    """Compute per-cell morphometric features from a watershed label map.
-    Returns (cells_list, summary_dict)."""
-    cells = []
-    unique_labels = [int(l) for l in np.unique(labels) if l > 0]
-
-    for lab in unique_labels:
-        mask_u8 = (labels == lab).astype(np.uint8) * 255
-        contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        if not contours:
-            continue
-        cnt = max(contours, key=cv2.contourArea)
-        area = cv2.contourArea(cnt)
-        if area < 5:
-            continue
-        perimeter = cv2.arcLength(cnt, True)
-        circularity = (4 * np.pi * area / (perimeter ** 2)) if perimeter > 0 else 0.0
-
-        eccentricity = 0.0
-        if len(cnt) >= 5:
-            (_, _), (ma, MA), _ = cv2.fitEllipse(cnt)
-            a, b = max(ma, MA), min(ma, MA)
-            if a > 0:
-                eccentricity = np.sqrt(max(0, 1 - (b / a) ** 2))
-
-        M = cv2.moments(cnt)
-        cx = int(M["m10"] / M["m00"]) if M["m00"] > 0 else 0
-        cy = int(M["m01"] / M["m00"]) if M["m00"] > 0 else 0
-
-        cells.append({
-            "label": lab,
-            "area": int(area),
-            "perimeter": round(perimeter, 2),
-            "circularity": round(min(circularity, 1.0), 4),
-            "eccentricity": round(eccentricity, 4),
-            "centroid": (cy, cx),
-        })
-
-    areas = [c["area"] for c in cells]
-    circs = [c["circularity"] for c in cells]
-    eccs = [c["eccentricity"] for c in cells]
-
-    summary = {
-        "total_cells_morpho": len(cells),
-        "mean_area": round(float(np.mean(areas)), 2) if areas else 0,
-        "median_area": round(float(np.median(areas)), 2) if areas else 0,
-        "std_area": round(float(np.std(areas)), 2) if areas else 0,
-        "mean_circularity": round(float(np.mean(circs)), 4) if circs else 0,
-        "mean_eccentricity": round(float(np.mean(eccs)), 4) if eccs else 0,
-    }
-    return cells, summary
-
-
-def build_spatial_heatmap(
-    seg_img: Image.Image,
-    orig_img: Image.Image,
-    labels: np.ndarray,
-    alpha: float = 0.5,
-    blur_ksize: int = 51,
-) -> np.ndarray:
-    """Create a density heatmap of positive cell locations overlaid on the original."""
-    seg_rgb = np.array(seg_img.convert("RGB"))
-    h, w = seg_rgb.shape[:2]
-
-    point_map = np.zeros((h, w), dtype=np.float32)
-
-    for lab in np.unique(labels):
-        if lab <= 0:
-            continue
-        mask_i = labels == lab
-        red_count = np.sum(seg_rgb[mask_i, 0] > 128)
-        blue_count = np.sum(seg_rgb[mask_i, 2] > 128)
-        if red_count < blue_count:
-            continue  # negative cell
-        ys, xs = np.where(mask_i)
-        cy, cx = int(np.mean(ys)), int(np.mean(xs))
-        if 0 <= cy < h and 0 <= cx < w:
-            point_map[cy, cx] += 1.0
-
-    ksize = blur_ksize if blur_ksize % 2 == 1 else blur_ksize + 1
-    density = cv2.GaussianBlur(point_map, (ksize, ksize), 0)
-
-    if density.max() > 0:
-        density = (density / density.max() * 255).astype(np.uint8)
-    else:
-        density = density.astype(np.uint8)
-
-    heatmap_bgr = cv2.applyColorMap(density, cv2.COLORMAP_JET)
-    heatmap_rgb = cv2.cvtColor(heatmap_bgr, cv2.COLOR_BGR2RGB)
-
-    orig_arr = np.array(orig_img.convert("RGB").resize((w, h)))
-    mask = density > 5
-    overlay = orig_arr.copy()
-    overlay[mask] = (
-        (1 - alpha) * orig_arr[mask].astype(np.float32)
-        + alpha * heatmap_rgb[mask].astype(np.float32)
-    ).astype(np.uint8)
-
-    return overlay
-
-
-def compute_hscore(
-    labels: np.ndarray,
-    seg_img: Image.Image,
-    marker_img: Image.Image,
-) -> tuple[dict, list[dict]]:
-    """Compute H-score from per-cell Marker channel intensity.
-    Bins: 0 (<50), 1+ (50-100), 2+ (100-175), 3+ (175-255).
-    H-score = (1*count_1+ + 2*count_2+ + 3*count_3+) / total * 100, range 0-300."""
-    marker_gray = np.array(marker_img.convert("L"))
-
-    bins = {"0": 0, "1+": 0, "2+": 0, "3+": 0}
-    cell_intensities = []
-    total_cells = 0
-
-    for lab in np.unique(labels):
-        if lab <= 0:
-            continue
-        mask_i = labels == lab
-        mean_intensity = float(np.mean(marker_gray[mask_i]))
-        total_cells += 1
-
-        if mean_intensity < 50:
-            bin_label = "0"
-        elif mean_intensity < 100:
-            bin_label = "1+"
-        elif mean_intensity < 175:
-            bin_label = "2+"
-        else:
-            bin_label = "3+"
-
-        bins[bin_label] += 1
-        cell_intensities.append({
-            "label": int(lab),
-            "mean_intensity": round(mean_intensity, 2),
-            "bin": bin_label,
-        })
-
-    raw_hscore = 1 * bins["1+"] + 2 * bins["2+"] + 3 * bins["3+"]
-    normalized = round(raw_hscore / total_cells * 100, 1) if total_cells > 0 else 0
-
-    summary = {
-        "h_score": normalized,
-        "h_score_raw": raw_hscore,
-        "count_0_negative": bins["0"],
-        "count_1plus_weak": bins["1+"],
-        "count_2plus_moderate": bins["2+"],
-        "count_3plus_strong": bins["3+"],
-        "total_scored": total_cells,
-        "pct_0": round(bins["0"] / total_cells * 100, 1) if total_cells else 0,
-        "pct_1plus": round(bins["1+"] / total_cells * 100, 1) if total_cells else 0,
-        "pct_2plus": round(bins["2+"] / total_cells * 100, 1) if total_cells else 0,
-        "pct_3plus": round(bins["3+"] / total_cells * 100, 1) if total_cells else 0,
-    }
-    return summary, cell_intensities
-
-
-def run_classical_analysis(
-    orig_img: Image.Image,
-    decoded: dict[str, Image.Image],
-) -> tuple[dict, dict[str, Image.Image]]:
-    """Run all classical CV analysis: watershed, morphometry, heatmap, H-score.
-    Works without the deepliif library — only needs Seg + Marker images from the API."""
-    seg = decoded.get("Seg") or decoded.get("seg")
-    if seg is None:
-        return {}, {}
-
-    marker = decoded.get("Marker") or decoded.get("marker")
-    analysis: dict = {}
-    extra_images: dict[str, Image.Image] = {}
-
-    # 1. Watershed refinement
-    labels = None
-    try:
-        labels, refined_rgb = watershed_refine(seg)
-        extra_images["Watershed"] = Image.fromarray(refined_rgb)
-
-        seg_rgb = np.array(seg.convert("RGB"))
-        unique = [l for l in np.unique(labels) if l > 0]
-        pos_count = sum(
-            1 for l in unique
-            if np.sum(seg_rgb[labels == l, 0] > 128) >= np.sum(seg_rgb[labels == l, 2] > 128)
-        )
-        neg_count = len(unique) - pos_count
-        analysis["watershed"] = {
-            "num_total": len(unique),
-            "num_pos": pos_count,
-            "num_neg": neg_count,
-            "percent_pos": round(pos_count / len(unique) * 100, 2) if unique else 0,
-        }
-    except Exception:
-        analysis["watershed"] = {}
-
-    # 2. Morphometry
-    if labels is not None:
-        try:
-            morph_cells, morph_summary = compute_morphometry(labels)
-            analysis["morphometry"] = {"summary": morph_summary, "cells": morph_cells}
-        except Exception:
-            analysis["morphometry"] = {}
-    else:
-        analysis["morphometry"] = {}
-
-    # 3. Spatial heatmap
-    if labels is not None:
-        try:
-            heatmap_arr = build_spatial_heatmap(seg, orig_img, labels)
-            extra_images["Heatmap"] = Image.fromarray(heatmap_arr)
-            analysis["heatmap_generated"] = True
-        except Exception:
-            analysis["heatmap_generated"] = False
-    else:
-        analysis["heatmap_generated"] = False
-
-    # 4. H-score
-    if labels is not None and marker is not None:
-        try:
-            hscore_summary, cell_intensities = compute_hscore(labels, seg, marker)
-            analysis["hscore"] = {"summary": hscore_summary, "cell_intensities": cell_intensities}
-        except Exception:
-            analysis["hscore"] = {}
-    else:
-        analysis["hscore"] = {}
-
-    return analysis, extra_images
-
-
-def run_video_frame_scoring(
-    frame_img: Image.Image,
-    decoded: dict,
-    resolution: str,
-) -> tuple[dict, list]:
-    """Like run_local_scoring but also returns per-cell centroid data for
-    cross-frame deduplication.  Returns (scoring_dict, cells_list) where
-    each cell is {centroid: (y, x), positive: bool}."""
-    if not _DEEPLIIF_PP:
-        return {}, []
-
-    seg = decoded.get("Seg") or decoded.get("seg")
-    if seg is None:
-        return {}, []
-
-    marker = decoded.get("Marker") or decoded.get("marker")
-
-    try:
-        seg_rgb    = seg.convert("RGB")
-        marker_rgb = marker.convert("RGB") if marker is not None else None
-
-        # Detect cells once; reuse data for both per-cell list and scoring
-        cell_data = _deepliif_cell_results(seg_rgb, marker_rgb, resolution)
-        cells = [
-            {"centroid": c["centroid"], "positive": bool(c["positive"])}
-            for c in cell_data.get("cells", [])
-        ]
-
-        # Derive aggregate scoring without re-running detection
-        _, _, scoring = _deepliif_cells_to_final(
-            data=cell_data,
-            orig=frame_img.convert("RGB"),
-        )
-        return scoring, cells
-    except Exception:
-        return {}, []
+        for img in pil_frames:
+            writer.write(cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR))
+        writer.release()
+        with open(tmp.name, "rb") as f:
+            return f.read()
+    finally:
+        os.unlink(tmp.name)
 
 
 def deduplicate_video_cells(all_results: dict, dedup_radius: int = 20) -> dict:
-    """Deduplicate cells across overlapping video frames (e.g. WSI scans).
-
-    Algorithm:
-      1. For each frame, estimate the shift from the previous frame using
-         phase correlation on the Seg image.
-      2. Convert every cell centroid to a global coordinate system using
-         the cumulative shift.
-      3. Insert into a spatial grid; skip any cell whose global position
-         is within `dedup_radius` pixels of an already-inserted cell.
-
-    Returns a scoring dict with num_total, num_pos, num_neg, percent_pos.
-    """
-    grid: dict = {}   # (grid_x, grid_y) -> [(gx, gy, is_positive), ...]
-    cumulative = np.array([0.0, 0.0])   # (dx, dy) in global coords
+    """Deduplicate cells across overlapping video frames (e.g. WSI scans)."""
+    grid: dict = {}
+    cumulative = np.array([0.0, 0.0])
     prev_gray  = None
     raw_total  = 0
 
@@ -586,25 +155,20 @@ def deduplicate_video_cells(all_results: dict, dedup_radius: int = 20) -> dict:
         if not cells:
             continue
 
-        # ── Estimate shift from previous frame ────────────────────────────
         seg = res["images"].get("Seg") or res["images"].get("seg")
         if seg is not None:
             curr_gray = np.array(seg.convert("L"), dtype=np.float32)
             if prev_gray is not None and prev_gray.shape == curr_gray.shape:
                 try:
                     shift, _ = cv2.phaseCorrelate(prev_gray, curr_gray)
-                    # phaseCorrelate(prev, curr) returns (dx, dy) such that
-                    # prev shifted by (dx, dy) ≈ curr.
-                    # Global coord = frame_coord - cumulative_shift
                     cumulative += np.array(shift)
                 except Exception:
                     pass
             prev_gray = curr_gray
 
-        # ── Insert cells into global grid ─────────────────────────────────
         for cell in cells:
             raw_total += 1
-            cy, cx = cell["centroid"]          # (row, col) = (y, x)
+            cy, cx = cell["centroid"]
             gx = cx - cumulative[0]
             gy = cy - cumulative[1]
             gix = int(gx // dedup_radius)
@@ -647,45 +211,6 @@ def deduplicate_video_cells(all_results: dict, dedup_radius: int = 20) -> dict:
     }
 
 
-def interpolate_frames(frames: list, steps: int) -> list:
-    """Insert `steps` linearly blended frames between every consecutive pair."""
-    if steps == 0 or len(frames) < 2:
-        return frames
-    out = []
-    for i in range(len(frames) - 1):
-        out.append(frames[i])
-        a = np.array(frames[i].convert("RGB"), dtype=float)
-        b = np.array(frames[i + 1].convert("RGB"), dtype=float)
-        for s in range(1, steps + 1):
-            t = s / (steps + 1)
-            out.append(Image.fromarray(((1 - t) * a + t * b).astype(np.uint8)))
-    out.append(frames[-1])
-    return out
-
-
-def frames_to_video(pil_frames: list, fps: float) -> bytes:
-    """Stitch a list of PIL images into an MP4 and return the bytes."""
-    if not pil_frames:
-        return b""
-    w, h = pil_frames[0].size
-    tmp = tempfile.NamedTemporaryFile(suffix=".mp4", delete=False)
-    tmp.close()
-    try:
-        writer = cv2.VideoWriter(
-            tmp.name,
-            cv2.VideoWriter_fourcc(*"mp4v"),
-            float(fps),
-            (w, h),
-        )
-        for img in pil_frames:
-            writer.write(cv2.cvtColor(np.array(img.convert("RGB")), cv2.COLOR_RGB2BGR))
-        writer.release()
-        with open(tmp.name, "rb") as f:
-            return f.read()
-    finally:
-        os.unlink(tmp.name)
-
-
 def build_zip(all_results: dict) -> io.BytesIO:
     buf = io.BytesIO()
     with zipfile.ZipFile(buf, "w", zipfile.ZIP_DEFLATED) as zf:
@@ -698,33 +223,21 @@ def build_zip(all_results: dict) -> io.BytesIO:
                 f"{name}/scoring.json",
                 json.dumps(res["scoring"], indent=2),
             )
-            # Classical CV analysis JSONs
-            analysis = res.get("_analysis", {})
-            if analysis:
-                summary_out = {
-                    "watershed": analysis.get("watershed", {}),
-                    "morphometry_summary": analysis.get("morphometry", {}).get("summary", {}),
-                    "hscore": analysis.get("hscore", {}).get("summary", {}),
-                    "heatmap_generated": analysis.get("heatmap_generated", False),
-                }
-                zf.writestr(
-                    f"{name}/cv_analysis.json",
-                    json.dumps(summary_out, indent=2),
-                )
-                morph_cells = analysis.get("morphometry", {}).get("cells", [])
-                if morph_cells:
-                    zf.writestr(
-                        f"{name}/morphometry_cells.json",
-                        json.dumps(morph_cells, indent=2),
-                    )
-                hscore_cells = analysis.get("hscore", {}).get("cell_intensities", [])
-                if hscore_cells:
-                    zf.writestr(
-                        f"{name}/hscore_cells.json",
-                        json.dumps(hscore_cells, indent=2),
-                    )
     buf.seek(0)
     return buf
+
+
+# ─── Segmentation config shared across all code paths ────────────────────────
+
+def _seg_kwargs() -> dict:
+    """Collect the current sidebar settings into kwargs for segment()."""
+    return dict(
+        resolution=resolution,
+        prob_thresh=prob_thresh,
+        slim=slim,
+        nopost=nopost,
+        use_pil=use_pil,
+    )
 
 
 # ─── UI ──────────────────────────────────────────────────────────────────────
@@ -759,11 +272,6 @@ with st.sidebar:
         "Pillow loader (faster, PNG/JPG only)",
         help="Uncheck to use Bio-Formats for TIF/WSI",
     )
-    run_cv_analysis = st.checkbox(
-        "Classical CV analysis",
-        value=True,
-        help="Watershed refinement, morphometry, spatial heatmap, and H-score (OpenCV-based, no deepliif dependency)",
-    )
 
 
 # --- Main: upload + format picker --------------------------------------------
@@ -780,7 +288,7 @@ if uploaded:
     every_n_sec = 1.0
     out_fps = 5
     interp_steps = 1
-    api_delay = 1.0
+    max_workers = 4
     if ext in VIDEO_FORMATS:
         every_n_sec = st.slider(
             "Extract one frame every N seconds", 0.5, 10.0, 1.0, 0.5,
@@ -794,82 +302,62 @@ if uploaded:
             "Smoothing interpolation steps", 0, 4, 1,
             help="Blended frames inserted between each processed frame — makes motion smoother without extra API calls",
         )
-        api_delay = st.slider(
-            "Delay between API calls (s)", 0.0, 5.0, 1.0, 0.5,
-            help="Pause between frames to avoid overloading the TuroQuant server",
+        max_workers = st.slider(
+            "Parallel workers", 1, 8, 4,
+            help="Number of frames sent to the API at the same time. Higher = faster but may overload the server.",
         )
-
-    # Build API param dict — match official API spec exactly
-    # Only 'resolution' is always required; all others are opt-in flags
-    api_params: dict = {"resolution": resolution}
-    if slim:
-        api_params["slim"] = "true"
-    if nopost:
-        api_params["nopost"] = "true"
-    else:
-        # prob_thresh only applies when postprocessing is active (API expects 0–254)
-        api_params["prob_thresh"] = int(prob_thresh * 254)
-    if use_pil:
-        api_params["pil"] = "true"
 
     if st.button("Run TuroQuant", type="primary"):
         # Quick server reachability check
-        try:
-            ping = requests.get("https://deepliif.org", timeout=10)
-            if ping.status_code >= 500:
-                st.error("TuroQuant server is returning errors right now. Try again later.")
-                st.stop()
-        except Exception:
-            st.error("Cannot reach TuroQuant server. Check your internet connection.")
+        if not check_server():
+            st.error("Cannot reach TuroQuant server or it is returning errors. Try again later.")
             st.stop()
 
         raw_bytes = uploaded.read()
         all_results: dict = {}
         error_occurred = False
+        kwargs = _seg_kwargs()
 
-        # ── Video ──────────────────────────────────────────────────────────
+        # ── Video (parallel) ───────────────────────────────────────────────
         if ext in VIDEO_FORMATS:
             with st.spinner("Extracting frames…"):
                 frames = extract_video_frames(raw_bytes, ext, every_n_sec)
-            st.info(f"{len(frames)} frame(s) extracted")
+            st.info(f"{len(frames)} frame(s) extracted — processing with {max_workers} parallel workers")
             bar = st.progress(0, text="Processing frames…")
+            done_count = 0
 
-            for i, frame_arr in enumerate(frames):
-                if i > 0 and api_delay > 0:
-                    time.sleep(api_delay)
+            def _process_frame(i, frame_arr):
                 fname = f"frame_{i:04d}"
-                try:
-                    frame_img, notes = prepare_image(Image.fromarray(frame_arr), resolution)
-                    if notes:
-                        st.caption(f"{fname}: {', '.join(notes)}")
-                    png = image_to_png_bytes(frame_img)
-                    raw = call_api(png, f"{fname}.png", api_params)
-                    sc, raw_keys, sc_key_found = extract_scoring(raw)
-                    decoded_imgs = decode_result_images(raw)
-                    local_sc, frame_cells = run_video_frame_scoring(frame_img, decoded_imgs, resolution)
-                    if local_sc:
-                        sc = local_sc
-                        sc_key_found = True
-                    cv_analysis = {}
-                    if run_cv_analysis:
-                        cv_analysis, cv_extras = run_classical_analysis(frame_img, decoded_imgs)
-                        decoded_imgs.update(cv_extras)
-                    all_results[fname] = {
-                        "images": decoded_imgs,
-                        "scoring": sc,
-                        "_cells": frame_cells,
-                        "_analysis": cv_analysis,
-                        "_raw_keys": raw_keys,
-                        "_sc_key_found": sc_key_found,
-                    }
-                except PostprocessingError as e:
-                    st.warning(str(e))
-                    st.session_state["_request_nopost"] = True
-                    st.rerun()
-                except Exception as e:
-                    st.warning(f"{fname}: {e}")
-                    error_occurred = True
-                bar.progress((i + 1) / len(frames), text=f"Frame {i+1}/{len(frames)}")
+                result = segment_video_frame(Image.fromarray(frame_arr), **kwargs)
+                return i, fname, result
+
+            with ThreadPoolExecutor(max_workers=max_workers) as pool:
+                futures = {
+                    pool.submit(_process_frame, i, arr): i
+                    for i, arr in enumerate(frames)
+                }
+                for future in as_completed(futures):
+                    done_count += 1
+                    try:
+                        i, fname, result = future.result()
+                        if result["notes"]:
+                            st.caption(f"{fname}: {', '.join(result['notes'])}")
+                        all_results[fname] = {
+                            "images": result["images"],
+                            "scoring": result["scoring"],
+                            "_cells": result["cells"],
+                        }
+                    except PostprocessingError as e:
+                        st.warning(str(e))
+                        st.session_state["_request_nopost"] = True
+                        st.rerun()
+                    except Exception as e:
+                        st.warning(f"frame_{futures[future]:04d}: {e}")
+                        error_occurred = True
+                    bar.progress(done_count / len(frames), text=f"Frame {done_count}/{len(frames)}")
+
+            # Sort results by frame order (as_completed returns in finish order)
+            all_results = dict(sorted(all_results.items()))
 
         # ── TIF (multi-page) ───────────────────────────────────────────────
         elif ext in ("tif", "tiff"):
@@ -881,28 +369,12 @@ if uploaded:
             for i, page_img in enumerate(pages):
                 fname = f"page_{i:04d}"
                 try:
-                    page_img, notes = prepare_image(page_img, resolution)
-                    if notes:
-                        st.caption(f"{fname}: {', '.join(notes)}")
-                    png = image_to_png_bytes(page_img)
-                    raw = call_api(png, f"{fname}.png", api_params)
-                    sc, raw_keys, sc_key_found = extract_scoring(raw)
-                    decoded_imgs = decode_result_images(raw)
-                    local_sc, extras = run_local_scoring(page_img, decoded_imgs, resolution)
-                    if local_sc:
-                        sc = local_sc
-                        sc_key_found = True
-                        decoded_imgs.update(extras)
-                    cv_analysis = {}
-                    if run_cv_analysis:
-                        cv_analysis, cv_extras = run_classical_analysis(page_img, decoded_imgs)
-                        decoded_imgs.update(cv_extras)
+                    result = segment(page_img, **kwargs)
+                    if result["notes"]:
+                        st.caption(f"{fname}: {', '.join(result['notes'])}")
                     all_results[fname] = {
-                        "images": decoded_imgs,
-                        "scoring": sc,
-                        "_analysis": cv_analysis,
-                        "_raw_keys": raw_keys,
-                        "_sc_key_found": sc_key_found,
+                        "images": result["images"],
+                        "scoring": result["scoring"],
                     }
                 except PostprocessingError as e:
                     st.warning(str(e))
@@ -918,28 +390,12 @@ if uploaded:
             with st.spinner("Processing…"):
                 try:
                     src_img = Image.open(io.BytesIO(raw_bytes))
-                    src_img, notes = prepare_image(src_img, resolution)
-                    if notes:
-                        st.caption(f"image: {', '.join(notes)}")
-                    raw_bytes = image_to_png_bytes(src_img)
-                    raw = call_api(raw_bytes, uploaded.name, api_params)
-                    sc, raw_keys, sc_key_found = extract_scoring(raw)
-                    decoded_imgs = decode_result_images(raw)
-                    local_sc, extras = run_local_scoring(src_img, decoded_imgs, resolution)
-                    if local_sc:
-                        sc = local_sc
-                        sc_key_found = True
-                        decoded_imgs.update(extras)
-                    cv_analysis = {}
-                    if run_cv_analysis:
-                        cv_analysis, cv_extras = run_classical_analysis(src_img, decoded_imgs)
-                        decoded_imgs.update(cv_extras)
+                    result = segment(src_img, **kwargs)
+                    if result["notes"]:
+                        st.caption(f"image: {', '.join(result['notes'])}")
                     all_results["result"] = {
-                        "images": decoded_imgs,
-                        "scoring": sc,
-                        "_analysis": cv_analysis,
-                        "_raw_keys": raw_keys,
-                        "_sc_key_found": sc_key_found,
+                        "images": result["images"],
+                        "scoring": result["scoring"],
                     }
                 except PostprocessingError as e:
                     st.warning(str(e))
@@ -1014,20 +470,6 @@ if "_results" in st.session_state:
                 zf.writestr(f"{ch}.mp4", vdata["bytes"])
             if _deduped:
                 zf.writestr("scoring_summary.json", json.dumps(_deduped, indent=2))
-            # Aggregate classical analysis across frames
-            _frame_analyses = [r.get("_analysis", {}) for r in _all.values() if r.get("_analysis")]
-            if _frame_analyses:
-                _ws_t = sum(a.get("watershed", {}).get("num_total", 0) for a in _frame_analyses)
-                _ws_p = sum(a.get("watershed", {}).get("num_pos", 0) for a in _frame_analyses)
-                _hs_vals = [a.get("hscore", {}).get("summary", {}).get("h_score") for a in _frame_analyses]
-                _hs_vals = [h for h in _hs_vals if h is not None]
-                cv_agg = {
-                    "watershed_total": _ws_t,
-                    "watershed_pos": _ws_p,
-                    "watershed_neg": _ws_t - _ws_p,
-                    "avg_h_score": round(float(np.mean(_hs_vals)), 1) if _hs_vals else None,
-                }
-                zf.writestr("cv_analysis_summary.json", json.dumps(cv_agg, indent=2))
         all_zip.seek(0)
         st.download_button(
             "Download all channels (.zip)",
@@ -1066,41 +508,6 @@ if "_results" in st.session_state:
                 m3.metric("Negative Cells", agg_neg)
                 m4.metric("% Positive",     f"{agg_pct}%")
 
-        # ── Classical CV analysis (aggregated across video frames) ──────────
-        frame_analyses = [r.get("_analysis", {}) for r in _all.values() if r.get("_analysis")]
-        if frame_analyses:
-            st.markdown("---")
-            st.subheader("Classical CV Analysis (across frames)")
-
-            ws_totals = [a.get("watershed", {}).get("num_total", 0) for a in frame_analyses]
-            ws_pos = [a.get("watershed", {}).get("num_pos", 0) for a in frame_analyses]
-            if sum(ws_totals) > 0:
-                total_ws = sum(ws_totals)
-                total_pos_ws = sum(ws_pos)
-                st.caption("Watershed-refined counts (per-frame sum)")
-                aw1, aw2, aw3, aw4 = st.columns(4)
-                aw1.metric("Total (watershed)", total_ws)
-                aw2.metric("Positive", total_pos_ws)
-                aw3.metric("Negative", total_ws - total_pos_ws)
-                aw4.metric("% Positive", f"{round(total_pos_ws / total_ws * 100, 2)}%")
-
-            hscores = [
-                a.get("hscore", {}).get("summary", {}).get("h_score", None)
-                for a in frame_analyses
-            ]
-            hscores = [h for h in hscores if h is not None]
-            if hscores:
-                st.metric("Average H-Score across frames", round(float(np.mean(hscores)), 1))
-
-            morph_summaries = [a.get("morphometry", {}).get("summary", {}) for a in frame_analyses]
-            mean_areas = [m.get("mean_area", 0) for m in morph_summaries if m.get("mean_area")]
-            if mean_areas:
-                mc1, mc2 = st.columns(2)
-                mc1.metric("Avg Mean Cell Area (px)", round(float(np.mean(mean_areas)), 2))
-                mean_circs = [m.get("mean_circularity", 0) for m in morph_summaries if m.get("mean_circularity")]
-                if mean_circs:
-                    mc2.metric("Avg Mean Circularity", round(float(np.mean(mean_circs)), 4))
-
         st.subheader("Output channels")
         for ch, vdata in _vmap.items():
             col1, col2 = st.columns([4, 1])
@@ -1131,7 +538,6 @@ if "_results" in st.session_state:
             with st.expander(name, expanded=(len(_all) == 1)):
                 sc = res["scoring"]
                 if sc and "num_total" in sc:
-                    # Local TuroQuant scoring (full detail)
                     pct = sc.get("percent_pos", 0)
                     pct_str = f"{round(pct, 2)}%" if isinstance(pct, (int, float)) else str(pct)
                     ratio = (
@@ -1145,82 +551,16 @@ if "_results" in st.session_state:
                     m4.metric("% Positive",     pct_str)
                     m5.metric("Pos : Neg",       ratio)
                 elif sc:
-                    # Fallback: API-level scoring (older key names)
                     c1, c2, c3 = st.columns(3)
                     c1.metric("Total Nuclei",   sc.get("total_nuclei",    sc.get("num_total", "—")))
                     c2.metric("Positive Cells", sc.get("positive_cells",  sc.get("num_pos",   "—")))
                     c3.metric("% Positive",     sc.get("percent_positive",sc.get("percent_pos","—")))
                 else:
-                    if res.get("_sc_key_found"):
-                        st.warning(
-                            "The API returned a `scoring` key but it was empty — "
-                            "the server may not have produced cell counts for this image "
-                            "(check that postprocessing is enabled and the image meets size requirements)."
-                        )
-                    else:
-                        raw_keys = res.get("_raw_keys", [])
-                        st.warning(
-                            f"No scoring key found in the API response. "
-                            f"Top-level keys returned: `{raw_keys}`."
-                        )
-
-                # ── Classical CV Analysis ──────────────────────────────────
-                analysis = res.get("_analysis", {})
-                if analysis:
-                    st.markdown("---")
-
-                    ws = analysis.get("watershed", {})
-                    if ws and ws.get("num_total", 0) > 0:
-                        st.subheader("Watershed-Refined Cell Counts")
-                        w1, w2, w3, w4 = st.columns(4)
-                        w1.metric("Total (watershed)", ws["num_total"])
-                        w2.metric("Positive", ws["num_pos"])
-                        w3.metric("Negative", ws["num_neg"])
-                        w4.metric("% Positive", f"{ws['percent_pos']}%")
-
-                    hs = analysis.get("hscore", {}).get("summary", {})
-                    if hs:
-                        st.subheader("H-Score")
-                        h1, h2, h3, h4, h5 = st.columns(5)
-                        h1.metric("H-Score", hs["h_score"])
-                        h2.metric("Negative (0)", f"{hs['count_0_negative']} ({hs['pct_0']}%)")
-                        h3.metric("Weak (1+)", f"{hs['count_1plus_weak']} ({hs['pct_1plus']}%)")
-                        h4.metric("Moderate (2+)", f"{hs['count_2plus_moderate']} ({hs['pct_2plus']}%)")
-                        h5.metric("Strong (3+)", f"{hs['count_3plus_strong']} ({hs['pct_3plus']}%)")
-
-                    morph = analysis.get("morphometry", {})
-                    morph_summary = morph.get("summary", {})
-                    morph_cells = morph.get("cells", [])
-                    if morph_summary and morph_cells:
-                        st.subheader("Cell Morphometry")
-                        mc1, mc2, mc3, mc4 = st.columns(4)
-                        mc1.metric("Mean Area (px)", morph_summary["mean_area"])
-                        mc2.metric("Median Area (px)", morph_summary["median_area"])
-                        mc3.metric("Std Area", morph_summary["std_area"])
-                        mc4.metric("Mean Circularity", morph_summary["mean_circularity"])
-
-                        areas = [c["area"] for c in morph_cells]
-                        if areas:
-                            bin_count = min(20, max(5, len(areas) // 10))
-                            bin_edges = np.linspace(min(areas), max(areas) + 1, bin_count + 1)
-                            hist_vals = np.histogram(areas, bins=bin_edges)[0]
-                            chart_data = {
-                                f"{int(bin_edges[i])}-{int(bin_edges[i+1])}": int(hist_vals[i])
-                                for i in range(bin_count)
-                            }
-                            st.caption("Cell Area Distribution (px)")
-                            st.bar_chart(chart_data)
-
-                        circs = [c["circularity"] for c in morph_cells]
-                        if circs:
-                            circ_bins = np.linspace(0, 1.0, 11)
-                            circ_hist = np.histogram(circs, bins=circ_bins)[0]
-                            circ_chart = {
-                                f"{circ_bins[i]:.1f}-{circ_bins[i+1]:.1f}": int(circ_hist[i])
-                                for i in range(10)
-                            }
-                            st.caption("Circularity Distribution")
-                            st.bar_chart(circ_chart)
+                    st.warning(
+                        "No scoring data returned — the server may not have produced "
+                        "cell counts for this image (check that postprocessing is enabled "
+                        "and the image meets size requirements)."
+                    )
 
                 imgs = res["images"]
                 if imgs:

@@ -25,8 +25,8 @@ Upload an IHC image, multi-page TIF, or video scan of a whole-slide image (WSI) 
 ### Installation
 
 ```bash
-git clone https://github.com/modelpath-dev/TuroQuant.git
-cd TuroQuant
+git clone https://github.com/modelpath-dev/Deep-Liif.git
+cd Deep-Liif
 
 python -m venv .venv
 source .venv/bin/activate        # Linux/macOS
@@ -87,7 +87,7 @@ The result is an accurate unique cell count across the entire slide scan.
 ## Project Structure
 
 ```
-TuroQuant/
+Deep-Liif/
   app.py              # Streamlit application (all logic)
   requirements.txt    # Python dependencies
   sample_data/        # Example input files
@@ -95,6 +95,11 @@ TuroQuant/
     sample2.mov       # Sample WSI video scan
 ```
 
+## API Reference
 
+This app uses the TuroQuant inference API:
+- Endpoint: `https://deepliif.org/api/infer`
 
+## License
 
+See [DeepLIIF License](https://github.com/nadeemlab/DeepLIIF/blob/main/LICENSE) for the underlying model and library.
