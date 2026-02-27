@@ -40,7 +40,10 @@ export async function POST(request: NextRequest) {
     });
 
     if (!response.ok) {
-      const text = await response.text().catch(() => "");
+      const rawText = await response.text().catch(() => "");
+      // Strip HTML from error responses so users see a clean message
+      const text = rawText.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+
       if (response.status === 500 && nopost !== "true") {
         return NextResponse.json(
           {
@@ -51,8 +54,14 @@ export async function POST(request: NextRequest) {
           { status: 500 },
         );
       }
+
+      const friendlyMsg =
+        response.status === 500
+          ? "The server encountered an internal error. The image may be too large or the server is overloaded — please try again with a smaller image or try later."
+          : `TuroQuant API error (HTTP ${response.status}): ${text || "Unknown error"}`;
+
       return NextResponse.json(
-        { error: `TuroQuant API error (HTTP ${response.status}): ${text}` },
+        { error: friendlyMsg, retryable: response.status >= 500 },
         { status: response.status },
       );
     }

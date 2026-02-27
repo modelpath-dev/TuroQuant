@@ -34,8 +34,12 @@ export async function inferImage(
       if (!res.ok) {
         const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
         if (data.retryWithNopost) {
-          // Retry with nopost
           formData.set("nopost", "true");
+          continue;
+        }
+        // Retry on server errors (500+) before giving up
+        if (data.retryable || res.status >= 500) {
+          lastError = new Error(data.error || `HTTP ${res.status}`);
           continue;
         }
         throw new Error(data.error || `HTTP ${res.status}`);
