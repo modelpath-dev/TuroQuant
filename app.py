@@ -51,6 +51,18 @@ st.set_page_config(
     initial_sidebar_state="expanded",
 )
 
+# Hide Streamlit Cloud toolbar and profile badge
+st.markdown(
+    """<style>
+    [data-testid="stToolbar"]           {display: none !important;}
+    .viewerBadge_container__r5tak       {display: none !important;}
+    .stDeployButton                     {display: none !important;}
+    [data-testid="stDecoration"]        {display: none !important;}
+    footer                              {display: none !important;}
+    #MainMenu                           {display: none !important;}
+    </style>""",
+    unsafe_allow_html=True,
+)
 
 # ─── Session state ───────────────────────────────────────────────────────────
 for k, v in {
