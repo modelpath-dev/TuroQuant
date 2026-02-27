@@ -7,8 +7,8 @@ __pycache__/
 *.pyc
 *.pyo
 
-# Streamlit
-.streamlit/
+# Streamlit — keep config.toml for deployment
+.streamlit/secrets.toml
 
 # OS files
 .DS_Store
