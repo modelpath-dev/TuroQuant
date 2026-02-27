@@ -16,3 +16,8 @@ Thumbs.db
 
 # Sample data
 sample_data/
+
+# Frontend
+frontend/node_modules/
+frontend/.next/
+frontend/.env.local
