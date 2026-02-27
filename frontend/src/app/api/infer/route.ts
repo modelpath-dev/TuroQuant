@@ -30,44 +30,71 @@ export async function POST(request: NextRequest) {
     if (slim === "true") params.set("slim", "true");
     if (pil === "true") params.set("pil", "true");
 
-    // Forward to TuroQuant API
-    const apiFormData = new FormData();
-    apiFormData.append("img", img, img.name || "image.png");
+    // Forward to TuroQuant API with server-side retries and timeout
+    const imgBytes = await img.arrayBuffer();
+    const maxRetries = 3;
+    let lastStatus = 0;
+    let lastErrorText = "";
 
-    const response = await fetch(`${API_URL}?${params}`, {
-      method: "POST",
-      body: apiFormData,
-    });
-
-    if (!response.ok) {
-      const rawText = await response.text().catch(() => "");
-      // Strip HTML from error responses so users see a clean message
-      const text = rawText.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
-
-      if (response.status === 500 && nopost !== "true") {
-        return NextResponse.json(
-          {
-            error:
-              "Server postprocessing failed (HTTP 500). Try with 'Skip postprocessing' enabled.",
-            retryWithNopost: true,
-          },
-          { status: 500 },
-        );
+    for (let attempt = 0; attempt < maxRetries; attempt++) {
+      if (attempt > 0) {
+        // If first attempt failed without nopost, enable it and retry
+        if (attempt === 1 && lastStatus === 500 && nopost !== "true") {
+          params.set("nopost", "true");
+        }
+        await new Promise((r) => setTimeout(r, 1500 * attempt));
       }
 
-      const friendlyMsg =
-        response.status === 500
-          ? "The server encountered an internal error. The image may be too large or the server is overloaded — please try again with a smaller image or try later."
-          : `TuroQuant API error (HTTP ${response.status}): ${text || "Unknown error"}`;
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 50000);
 
-      return NextResponse.json(
-        { error: friendlyMsg, retryable: response.status >= 500 },
-        { status: response.status },
-      );
+      try {
+        const apiFormData = new FormData();
+        apiFormData.append(
+          "img",
+          new Blob([imgBytes], { type: img.type || "image/png" }),
+          img.name || "image.png",
+        );
+
+        const response = await fetch(`${API_URL}?${params}`, {
+          method: "POST",
+          body: apiFormData,
+          signal: controller.signal,
+        });
+
+        clearTimeout(timeout);
+
+        if (response.ok) {
+          const data = await response.json();
+          return NextResponse.json(data);
+        }
+
+        lastStatus = response.status;
+        const rawText = await response.text().catch(() => "");
+        lastErrorText = rawText.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+
+        // Only retry on 500+ errors
+        if (response.status < 500) {
+          return NextResponse.json(
+            { error: `TuroQuant API error (HTTP ${response.status}): ${lastErrorText || "Unknown error"}` },
+            { status: response.status },
+          );
+        }
+      } catch (err) {
+        clearTimeout(timeout);
+        const msg = err instanceof Error ? err.message : String(err);
+        lastErrorText = msg.includes("abort") ? "Request timed out" : msg;
+        lastStatus = 500;
+      }
     }
 
-    const data = await response.json();
-    return NextResponse.json(data);
+    // All retries exhausted
+    const friendlyMsg =
+      "The server is currently unavailable or overloaded. All retry attempts failed — please try again in a few minutes.";
+    return NextResponse.json(
+      { error: friendlyMsg },
+      { status: lastStatus || 500 },
+    );
   } catch (error) {
     const message =
       error instanceof Error ? error.message : "Unknown error";

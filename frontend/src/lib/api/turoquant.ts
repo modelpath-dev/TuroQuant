@@ -3,12 +3,11 @@ import { INFER_API_URL } from "../constants";
 
 /**
  * Send an image to the TuroQuant API proxy and return the response.
- * Supports retry with exponential backoff.
+ * Server-side handles retries; client just sends once.
  */
 export async function inferImage(
   imageBlob: Blob,
   settings: Settings,
-  retries = 2,
 ): Promise<TuroQuantResponse> {
   const formData = new FormData();
   formData.append("img", imageBlob, "image.png");
@@ -18,48 +17,25 @@ export async function inferImage(
   if (settings.slim) formData.append("slim", "true");
   if (settings.usePil) formData.append("pil", "true");
 
-  let lastError: Error | null = null;
+  const res = await fetch(INFER_API_URL, {
+    method: "POST",
+    body: formData,
+  });
 
-  for (let attempt = 0; attempt <= retries; attempt++) {
-    if (attempt > 0) {
-      await new Promise((r) => setTimeout(r, Math.pow(2, attempt) * 1000));
-    }
-
-    try {
-      const res = await fetch(INFER_API_URL, {
-        method: "POST",
-        body: formData,
-      });
-
-      if (!res.ok) {
-        const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
-        if (data.retryWithNopost) {
-          formData.set("nopost", "true");
-          continue;
-        }
-        // Retry on server errors (500+) before giving up
-        if (data.retryable || res.status >= 500) {
-          lastError = new Error(data.error || `HTTP ${res.status}`);
-          continue;
-        }
-        throw new Error(data.error || `HTTP ${res.status}`);
-      }
-
-      const data = await res.json();
-
-      // Normalize response structure
-      const images = data.images || {};
-      const scoring =
-        data.scoring || data.scores || data.cell_scoring || data.score || data.results || {};
-      const notes: string[] = [];
-
-      return { images, scoring, notes };
-    } catch (err) {
-      lastError = err instanceof Error ? err : new Error(String(err));
-    }
+  if (!res.ok) {
+    const data = await res.json().catch(() => ({ error: `HTTP ${res.status}` }));
+    throw new Error(data.error || `HTTP ${res.status}`);
   }
 
-  throw lastError || new Error("Failed to infer image");
+  const data = await res.json();
+
+  // Normalize response structure
+  const images = data.images || {};
+  const scoring =
+    data.scoring || data.scores || data.cell_scoring || data.score || data.results || {};
+  const notes: string[] = [];
+
+  return { images, scoring, notes };
 }
 
 /**
