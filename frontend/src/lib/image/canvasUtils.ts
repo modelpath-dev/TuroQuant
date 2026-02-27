@@ -72,6 +72,44 @@ export async function fileToImageData(file: File): Promise<ImageData> {
 }
 
 /**
+ * Resize a File (image) so neither dimension exceeds maxDim.
+ * Returns the original file if already within limits.
+ */
+export async function resizeFileForUpload(
+  file: File,
+  maxDim: number,
+): Promise<Blob> {
+  return new Promise((resolve, reject) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      const img = new Image();
+      img.onload = () => {
+        if (img.width <= maxDim && img.height <= maxDim) {
+          resolve(file);
+          return;
+        }
+        const scale = Math.min(maxDim / img.width, maxDim / img.height);
+        const w = Math.round(img.width * scale);
+        const h = Math.round(img.height * scale);
+        const canvas = document.createElement("canvas");
+        canvas.width = w;
+        canvas.height = h;
+        const ctx = canvas.getContext("2d")!;
+        ctx.drawImage(img, 0, 0, w, h);
+        canvas.toBlob(
+          (blob) => (blob ? resolve(blob) : reject(new Error("resize failed"))),
+          "image/png",
+        );
+      };
+      img.onerror = () => reject(new Error("Failed to load image for resize"));
+      img.src = reader.result as string;
+    };
+    reader.onerror = () => reject(new Error("Failed to read file"));
+    reader.readAsDataURL(file);
+  });
+}
+
+/**
  * Convert ImageData to grayscale Uint8Array.
  */
 export function toGrayscale(imageData: ImageData): Uint8Array {

@@ -4,13 +4,13 @@ import { useState, useCallback } from "react";
 import type { AnalysisState, Settings, FrameResult, FileType, IntensityDistribution } from "@/types";
 import { isErPrScore } from "@/types";
 import { inferImage, imageDataToBlob } from "@/lib/api/turoquant";
-import { base64ToImageData, fileToImageData, imageDataToDataUrl } from "@/lib/image/canvasUtils";
+import { base64ToImageData, fileToImageData, imageDataToDataUrl, resizeFileForUpload } from "@/lib/image/canvasUtils";
 import { buildOverlay } from "@/lib/image/overlayBuilder";
 import { scoreImage, computeGlobalErPrScore } from "@/lib/scoring";
 import { extractVideoFrames } from "@/lib/video/frameExtractor";
 import { parseTiffPages } from "@/lib/tiff/tiffParser";
 import { deduplicateVideoCells, aggregateIntensityDistributions } from "@/lib/dedup/videoCellDedup";
-import { VIDEO_FORMATS, TIFF_FORMATS } from "@/lib/constants";
+import { VIDEO_FORMATS, TIFF_FORMATS, MAX_IMAGE_DIM } from "@/lib/constants";
 
 function getFileType(filename: string): FileType {
   const ext = filename.split(".").pop()?.toLowerCase() || "";
@@ -59,7 +59,9 @@ async function processSingleImage(
   settings: Settings,
   setState: React.Dispatch<React.SetStateAction<AnalysisState>>,
 ) {
-  const response = await inferImage(file, settings);
+  // Resize large images (especially from phone cameras) before uploading
+  const blob = await resizeFileForUpload(file, MAX_IMAGE_DIM);
+  const response = await inferImage(blob, settings);
   setState((prev) => ({ ...prev, progress: 50, progressText: "Analyzing cells..." }));
 
   const segKey = Object.keys(response.images).find(
