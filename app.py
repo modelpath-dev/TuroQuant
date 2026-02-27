@@ -55,18 +55,11 @@ st.set_page_config(
 st.markdown(
     """<style>
     [data-testid="stToolbar"]           {display: none !important;}
-    [data-testid="stDecoration"]        {display: none !important;}
-    .stDeployButton                     {display: none !important;}
-    #MainMenu                           {display: none !important;}
-    footer                              {display: none !important;}
     .viewerBadge_container__r5tak       {display: none !important;}
-    .stActionButton                     {display: none !important;}
-    iframe[title="streamlit_badge"]     {display: none !important;}
-    [data-testid="manage-app-button"]   {display: none !important;}
-    div[class*="viewerBadge"]           {display: none !important;}
-    section[data-testid="stSidebar"] .element-container:has(iframe) {display: none !important;}
-    .css-1dp5vir                        {display: none !important;}
-    div:has(> iframe[title*="badge"])   {display: none !important;}
+    .stDeployButton                     {display: none !important;}
+    [data-testid="stDecoration"]        {display: none !important;}
+    footer                              {display: none !important;}
+    #MainMenu                           {display: none !important;}
     </style>""",
     unsafe_allow_html=True,
 )
@@ -381,10 +374,7 @@ with st.sidebar:
     if st.button("Check server", use_container_width=True):
         with st.spinner("Checking…"):
             ok = check_server()
-        if ok:
-            st.success("Server reachable")
-        else:
-            st.error("Server unreachable")
+        st.success("Server reachable") if ok else st.error("Server unreachable")
 
 
 def _seg_kwargs() -> dict:
