@@ -14,7 +14,16 @@ export function Footer() {
             treatment decisions, or any other clinical use. Results should be
             validated by qualified pathologists before any clinical
             interpretation. This tool should not be used as a diagnostic
-            instrument in any way or form.
+            instrument in any way or form. Powered by{" "}
+            <a
+              href="https://pmc.ncbi.nlm.nih.gov/articles/PMC9494834/"
+              target="_blank"
+              rel="noopener noreferrer"
+              className="underline hover:text-foreground transition-colors"
+            >
+              DeepLIIF
+            </a>
+            .
           </p>
         </div>
       </div>
