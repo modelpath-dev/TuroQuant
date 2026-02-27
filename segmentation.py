@@ -107,6 +107,8 @@ def _call_api(png_bytes: bytes, fname: str, params: dict, retries: int = 3) -> d
                     raise RuntimeError(
                         "Server error (HTTP 500) \u2014 the server may be overloaded. Try again later."
                     )
+                if resp.status_code in (502, 503, 504):
+                    raise IOError(f"HTTP {resp.status_code}: {detail}")
                 raise RuntimeError(f"HTTP {resp.status_code}: {detail}")
             return resp.json()
         except (RuntimeError, PostprocessingError):

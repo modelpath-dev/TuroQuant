@@ -1,13 +1,41 @@
 # TuroQuant Pipeline
 
-A Streamlit web application for IHC (Immunohistochemistry) image quantification using the TuroQuant API and local postprocessing library.
+IHC (Immunohistochemistry) image quantification using the DeepLIIF API.
+Supports **KI67**, **ER**, and **PR** stain types with automated cell counting,
+H-score, and Allred scoring.
 
-Upload an IHC image, multi-page TIF, or video scan of a whole-slide image (WSI) and get:
-- Multiplex immunofluorescence channel decomposition (DAPI, Hematoxylin, Lap2, Marker, Seg)
-- Automated positive/negative cell counting with overlay visualisation
-- For video input: phase-correlation-based cell deduplication across overlapping frames so cells are not double-counted
+---
 
-## Supported Formats
+## Features
+
+### File Upload mode
+- Upload **images** (PNG, JPG, BMP), **multi-page TIF/TIFF**, or **video** (MP4, AVI, MOV, MKV, WebM)
+- All DeepLIIF output channels displayed (DAPI, Hema, Lap2, Marker, Seg)
+- Cell counting: Total / Positive / Negative / % Positive
+- Video: parallel frame processing + phase-correlation deduplication across overlapping frames
+- **Final index** shown at every step (frame N of N)
+- Download: individual channel MP4s, all-frames ZIP, scoring JSON
+
+### Camera mode
+- **Browser-based** live camera preview (uses WebRTC built into your browser — no driver issues)
+- Click the snapshot button to capture a frame
+- **ROI selection**: define a crop region with sliders, run only that region through DeepLIIF
+- **Batch capture**: add multiple frames, process as a deduplicated batch
+- ER/PR stain: shows **H-score** (0-300) and **Allred score** (0-8) in addition to counts
+
+---
+
+## Stain Types
+
+| Stain | Metrics |
+|-------|---------|
+| KI67  | Total cells, Positive, Negative, % Positive (proliferation index) |
+| ER    | All KI67 metrics + H-score, Allred score, intensity distribution (0/1+/2+/3+) |
+| PR    | Same as ER |
+
+---
+
+## Supported File Formats
 
 | Type | Formats |
 |------|---------|
@@ -15,26 +43,32 @@ Upload an IHC image, multi-page TIF, or video scan of a whole-slide image (WSI) 
 | Microscopy | TIF/TIFF (multi-page), SVS, NDPI, SCN, CZI, LIF, MRXS, VMS, VMU, QPTIFF |
 | Video | MP4, AVI, MOV, MKV, WebM |
 
+---
+
 ## Setup
 
-### Prerequisites
-
+### Requirements
 - Python 3.10+
-- Internet connection (for the TuroQuant inference API)
+- Internet connection (DeepLIIF API at `https://deepliif.org/api/infer`)
 
-### Installation
+### Install
 
 ```bash
 git clone https://github.com/modelpath-dev/Deep-Liif.git
-cd Deep-Liif
+cd TuroQuant
 
 python -m venv .venv
-source .venv/bin/activate        # Linux/macOS
-# .venv\Scripts\activate         # Windows
+
+# Windows:
+.venv\Scripts\activate
+
+# Linux / macOS:
+source .venv/bin/activate
 
 pip install -r requirements.txt
-pip install deepliif
 ```
+
+> **Note:** Do NOT run `pip install deepliif` — it is incompatible with Python 3.10+ and is not needed. All local scoring is handled by `scoring.py`.
 
 ### Run
 
@@ -42,64 +76,59 @@ pip install deepliif
 streamlit run app.py
 ```
 
-The app opens at `http://localhost:8501`.
+Opens at `http://localhost:8501`.
 
-## Usage
-
-1. **Upload** an image, TIF, or video file using the file uploader.
-2. **Configure options** in the sidebar:
-   - **Scan Resolution** (10x / 20x / 40x) — must match the resolution the slide was scanned at.
-   - **Probability Threshold** — minimum probability for a pixel to be classified as a positive cell.
-   - **Slim mode** — return only the segmentation image.
-   - **Skip postprocessing** — bypass server-side postprocessing (useful if the server returns HTTP 500).
-   - **Pillow loader** — use PIL instead of Bio-Formats for loading (faster for PNG/JPG).
-3. **Click "Run TuroQuant"** to send the image to the API and run local cell counting.
-4. **View results**:
-   - Channel images (DAPI, Hema, Lap2, Marker, Seg, Overlay, Refined)
-   - Cell count metrics: Total Cells, Positive, Negative, % Positive, Pos:Neg ratio
-   - For video: deduplicated aggregate counts across all frames
-5. **Download**:
-   - Individual channel videos (for video input)
-   - All channels + scoring JSON as a single ZIP
-   - All frame PNGs + per-frame scoring as a ZIP
-6. **Click "Process New Sample"** to clear results and start over.
-
-## How Cell Counting Works
-
-### Single Image / TIF
-
-The app sends the image to the TuroQuant API which returns channel-decomposed images. It then runs local postprocessing using the **Seg** (segmentation) and **Marker** images to detect and classify individual cells:
-- **Red cells** in the Seg image = positive (protein-expressing)
-- **Blue cells** in the Seg image = negative
-
-### Video (WSI Scan)
-
-When processing a video scan of a whole-slide image, consecutive frames overlap significantly. Naive per-frame counting would double-count cells in overlapping regions.
-
-The deduplication algorithm:
-1. Extracts per-cell centroids from each frame using `compute_cell_results`
-2. Estimates the inter-frame shift using **phase correlation** (`cv2.phaseCorrelate`) on the Seg images
-3. Maps all cell centroids to a **global coordinate system** using the cumulative shift
-4. Inserts cells into a **spatial grid** and skips any cell within a configurable dedup radius (default 20px) of an already-registered cell
-
-The result is an accurate unique cell count across the entire slide scan.
+---
 
 ## Project Structure
 
 ```
-Deep-Liif/
-  app.py              # Streamlit application (all logic)
-  requirements.txt    # Python dependencies
-  sample_data/        # Example input files
-    cell.png          # Sample IHC image
-    sample2.mov       # Sample WSI video scan
+TuroQuant/
+  app.py           # Streamlit application (File Upload + Camera modes)
+  segmentation.py  # DeepLIIF API client (swap backend here if needed)
+  scoring.py       # H-score, Allred, KI67 scoring from Seg + Marker images
+  requirements.txt # Python dependencies
+  README.md        # This file
 ```
+
+---
+
+## Sidebar Options
+
+| Option | Description |
+|--------|-------------|
+| Source | File Upload (full pipeline) or Camera (live browser capture) |
+| Stain | KI67 / ER / PR - controls which scoring metrics are shown |
+| Scan Resolution | 10x / 20x / 40x - must match your microscope setting |
+| Probability Threshold | Minimum confidence for cell classification |
+| Skip postprocessing | **Leave ON** - server postprocessing returns HTTP 500 |
+| Pillow loader | Faster for PNG/JPG; disable for TIF/WSI formats |
+
+---
+
+## How Cell Counting Works
+
+### Single Image / TIF
+The app sends the image to the DeepLIIF API which returns channel-decomposed images. Local scoring uses the **Seg** (segmentation) and **Marker** images:
+- **Red pixels** in Seg (R>150, G<100, B<100) = positive nuclei
+- **Blue pixels** in Seg (B>150, R<100, G<100) = negative nuclei
+- **Marker** channel brightness = DAB staining intensity (used for H-score / Allred)
+
+### Video / Batch
+Consecutive frames often overlap. The deduplication algorithm:
+1. Extracts per-cell centroids from each frame
+2. Estimates inter-frame shift using **phase correlation** (`cv2.phaseCorrelate`)
+3. Maps centroids to a global coordinate system
+4. Skips any cell within the dedup radius of an already-registered cell
+
+---
 
 ## API Reference
 
-This app uses the TuroQuant inference API:
-- Endpoint: `https://deepliif.org/api/infer`
+Endpoint: `https://deepliif.org/api/infer`
+
+To swap in a local model or different backend, edit only `segmentation.py` - `app.py` and `scoring.py` do not need to change.
 
 ## License
 
-See [DeepLIIF License](https://github.com/nadeemlab/DeepLIIF/blob/main/LICENSE) for the underlying model and library.
+See [DeepLIIF License](https://github.com/nadeemlab/DeepLIIF/blob/main/LICENSE).

@@ -1,5 +1,6 @@
 # Virtual environment
 .venv/
+venv/
 
 # Python cache
 __pycache__/
@@ -13,3 +14,5 @@ __pycache__/
 .DS_Store
 Thumbs.db
 
+# Sample data
+sample_data/

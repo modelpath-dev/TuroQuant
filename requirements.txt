@@ -1,6 +1,9 @@
 streamlit>=1.32.0
+streamlit-drawable-canvas>=0.9.3
+streamlit-autorefresh>=1.0.1
 requests>=2.31.0
 Pillow>=10.0.0
 opencv-python-headless>=4.9.0
 tifffile>=2024.1.30
 numpy>=1.26.0
+scikit-image>=0.21.0
