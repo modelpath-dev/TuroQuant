@@ -30,7 +30,7 @@ export async function POST(request: NextRequest) {
     if (slim === "true") params.set("slim", "true");
     if (pil === "true") params.set("pil", "true");
 
-    // Forward to TuroQuant API with server-side retries and timeout
+    // Read image bytes once for reuse across retries
     const imgBytes = await img.arrayBuffer();
     const maxRetries = 3;
     let lastStatus = 0;
@@ -38,7 +38,6 @@ export async function POST(request: NextRequest) {
 
     for (let attempt = 0; attempt < maxRetries; attempt++) {
       if (attempt > 0) {
-        // If first attempt failed without nopost, enable it and retry
         if (attempt === 1 && lastStatus === 500 && nopost !== "true") {
           params.set("nopost", "true");
         }
@@ -46,13 +45,13 @@ export async function POST(request: NextRequest) {
       }
 
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 50000);
+      const timeout = setTimeout(() => controller.abort(), 55000);
 
       try {
         const apiFormData = new FormData();
         apiFormData.append(
           "img",
-          new Blob([imgBytes], { type: img.type || "image/png" }),
+          new Blob([imgBytes], { type: "image/png" }),
           img.name || "image.png",
         );
 
@@ -71,12 +70,16 @@ export async function POST(request: NextRequest) {
 
         lastStatus = response.status;
         const rawText = await response.text().catch(() => "");
-        lastErrorText = rawText.replace(/<[^>]*>/g, "").replace(/\s+/g, " ").trim();
+        lastErrorText = rawText
+          .replace(/<[^>]*>/g, "")
+          .replace(/\s+/g, " ")
+          .trim();
 
-        // Only retry on 500+ errors
         if (response.status < 500) {
           return NextResponse.json(
-            { error: `TuroQuant API error (HTTP ${response.status}): ${lastErrorText || "Unknown error"}` },
+            {
+              error: `TuroQuant API error (HTTP ${response.status}): ${lastErrorText || "Unknown error"}`,
+            },
             { status: response.status },
           );
         }
@@ -88,7 +91,6 @@ export async function POST(request: NextRequest) {
       }
     }
 
-    // All retries exhausted
     const friendlyMsg =
       "The server is currently unavailable or overloaded. All retry attempts failed — please try again in a few minutes.";
     return NextResponse.json(

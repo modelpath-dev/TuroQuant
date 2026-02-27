@@ -24,7 +24,7 @@ export const DEFAULT_SETTINGS: Settings = {
   probThresh: 0.5,
   nopost: true,
   slim: false,
-  usePil: false,
+  usePil: true,
   dedupRadius: 20,
   everyNSec: 1.0,
   outFps: 5,
