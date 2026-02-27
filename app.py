@@ -54,12 +54,27 @@ st.set_page_config(
 # Hide Streamlit Cloud toolbar and profile badge
 st.markdown(
     """<style>
-    [data-testid="stToolbar"]           {display: none !important;}
-    .viewerBadge_container__r5tak       {display: none !important;}
-    .stDeployButton                     {display: none !important;}
-    [data-testid="stDecoration"]        {display: none !important;}
-    footer                              {display: none !important;}
-    #MainMenu                           {display: none !important;}
+    [data-testid="stToolbar"]        {display: none !important;}
+    [data-testid="stDecoration"]     {display: none !important;}
+    .stDeployButton                  {display: none !important;}
+    #MainMenu                        {display: none !important;}
+    footer                           {display: none !important;}
+    header[data-testid="stHeader"]   {display: none !important;}
+    div[class*="viewerBadge"]        {display: none !important;}
+    a[class*="viewerBadge"]          {display: none !important;}
+    [class*="viewerBadge"]           {display: none !important;}
+    .embeddedAppMetaInfoBar_container {display: none !important;}
+    [data-testid="stStatusWidget"]   {display: none !important;}
+    iframe[title*="badge"]           {display: none !important;}
+    iframe[title*="streamlit"]       {display: none !important;}
+    </style>""",
+)
+st.markdown(
+    """<style>
+    /* Catch any remaining fixed badge in bottom-right */
+    body > div:last-child > div:last-child > div:last-child {
+        display: none !important;
+    }
     </style>""",
     unsafe_allow_html=True,
 )

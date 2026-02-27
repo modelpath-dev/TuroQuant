@@ -1,2 +1,5 @@
 [server]
 maxUploadSize = 200  # MB — Streamlit Cloud resource limit
+
+[client]
+toolbarMode = "minimal"
