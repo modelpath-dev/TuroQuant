@@ -5,7 +5,7 @@ export async function GET() {
     const controller = new AbortController();
     const timeout = setTimeout(() => controller.abort(), 10000);
 
-    const res = await fetch("https://deepliif.org", {
+    const res = await fetch(process.env.TUROQUANT_API_URL || "https://deepliif.org", {
       method: "GET",
       signal: controller.signal,
     });

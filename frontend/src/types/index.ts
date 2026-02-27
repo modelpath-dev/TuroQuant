@@ -70,9 +70,9 @@ export function isErPrScore(s: ScoringResult): s is ErPrScore {
   return "hScore" in s;
 }
 
-// ─── DeepLIIF API ──────────────────────────────────────────────────────────
+// ─── API Response ──────────────────────────────────────────────────────────
 
-export interface DeepLIIFResponse {
+export interface TuroQuantResponse {
   images: Record<string, string>; // channel → base64
   scoring?: Record<string, unknown>;
   notes?: string[];

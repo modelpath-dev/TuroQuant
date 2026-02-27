@@ -1,15 +1,15 @@
-import type { Settings, DeepLIIFResponse } from "@/types";
-import { DEEPLIIF_API_URL } from "../constants";
+import type { Settings, TuroQuantResponse } from "@/types";
+import { INFER_API_URL } from "../constants";
 
 /**
- * Send an image to the DeepLIIF API proxy and return the response.
+ * Send an image to the TuroQuant API proxy and return the response.
  * Supports retry with exponential backoff.
  */
 export async function inferImage(
   imageBlob: Blob,
   settings: Settings,
   retries = 2,
-): Promise<DeepLIIFResponse> {
+): Promise<TuroQuantResponse> {
   const formData = new FormData();
   formData.append("img", imageBlob, "image.png");
   formData.append("resolution", settings.resolution);
@@ -26,7 +26,7 @@ export async function inferImage(
     }
 
     try {
-      const res = await fetch(DEEPLIIF_API_URL, {
+      const res = await fetch(INFER_API_URL, {
         method: "POST",
         body: formData,
       });

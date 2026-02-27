@@ -3,7 +3,7 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import type { Settings, FrameResult, DedupScoring, IntensityDistribution } from "@/types";
 import { isErPrScore } from "@/types";
-import { inferImage } from "@/lib/api/deepliif";
+import { inferImage } from "@/lib/api/turoquant";
 import { base64ToImageData, imageDataToDataUrl } from "@/lib/image/canvasUtils";
 import { buildOverlay } from "@/lib/image/overlayBuilder";
 import { scoreImage, computeGlobalErPrScore } from "@/lib/scoring";

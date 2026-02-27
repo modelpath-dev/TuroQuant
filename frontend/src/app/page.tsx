@@ -153,7 +153,7 @@ function FileUploadMode({
           TuroQuant Pipeline
         </h2>
         <p className="text-xs text-muted-foreground mt-0.5">
-          IHC quantification via DeepLIIF — supports video, multi-page TIF, and
+          IHC quantification via TuroQuant — supports video, multi-page TIF, and
           standard images
         </p>
       </div>

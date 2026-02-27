@@ -1,7 +1,7 @@
 import { HEALTH_API_URL } from "../constants";
 
 /**
- * Check if the DeepLIIF server is reachable.
+ * Check if the TuroQuant server is reachable.
  */
 export async function checkServerHealth(): Promise<boolean> {
   try {

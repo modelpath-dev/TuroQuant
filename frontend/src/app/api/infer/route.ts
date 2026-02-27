@@ -3,7 +3,7 @@ import { NextRequest, NextResponse } from "next/server";
 export const maxDuration = 60;
 
 const API_URL =
-  process.env.DEEPLIIF_API_URL || "https://deepliif.org/api/infer";
+  process.env.TUROQUANT_API_URL || "https://deepliif.org/api/infer";
 
 export async function POST(request: NextRequest) {
   try {
@@ -30,7 +30,7 @@ export async function POST(request: NextRequest) {
     if (slim === "true") params.set("slim", "true");
     if (pil === "true") params.set("pil", "true");
 
-    // Forward to DeepLIIF
+    // Forward to TuroQuant API
     const apiFormData = new FormData();
     apiFormData.append("img", img, img.name || "image.png");
 
@@ -52,7 +52,7 @@ export async function POST(request: NextRequest) {
         );
       }
       return NextResponse.json(
-        { error: `DeepLIIF API error (HTTP ${response.status}): ${text}` },
+        { error: `TuroQuant API error (HTTP ${response.status}): ${text}` },
         { status: response.status },
       );
     }

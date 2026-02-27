@@ -3,7 +3,7 @@
 import { useState, useCallback } from "react";
 import type { AnalysisState, Settings, FrameResult, FileType, IntensityDistribution } from "@/types";
 import { isErPrScore } from "@/types";
-import { inferImage, imageDataToBlob } from "@/lib/api/deepliif";
+import { inferImage, imageDataToBlob } from "@/lib/api/turoquant";
 import { base64ToImageData, fileToImageData, imageDataToDataUrl } from "@/lib/image/canvasUtils";
 import { buildOverlay } from "@/lib/image/overlayBuilder";
 import { scoreImage, computeGlobalErPrScore } from "@/lib/scoring";
@@ -33,7 +33,7 @@ export function useAnalysis() {
   const analyzeImage = useCallback(
     async (file: File, settings: Settings) => {
       const fileType = getFileType(file.name);
-      setState({ status: "processing", progress: 0, progressText: "Sending to DeepLIIF...", fileType });
+      setState({ status: "processing", progress: 0, progressText: "Sending to TuroQuant...", fileType });
 
       try {
         if (fileType === "image") {
@@ -69,7 +69,7 @@ async function processSingleImage(
     (k) => k.toLowerCase() === "marker",
   );
 
-  if (!segKey) throw new Error("DeepLIIF did not return a Seg image.");
+  if (!segKey) throw new Error("TuroQuant did not return a Seg image.");
 
   const segImageData = await base64ToImageData(response.images[segKey]);
   const markerImageData = markerKey

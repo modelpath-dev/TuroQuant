@@ -228,7 +228,7 @@ export function CameraCapture({ settings, stain }: CameraCaptureProps) {
           text={
             camera.batchProgress.total > 0
               ? `Processing frame ${camera.batchProgress.current} of ${camera.batchProgress.total}...`
-              : "Sending to DeepLIIF..."
+              : "Sending to TuroQuant..."
           }
           progress={
             camera.batchProgress.total > 0

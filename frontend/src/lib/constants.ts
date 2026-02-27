@@ -41,5 +41,5 @@ export const MIN_DIM_MAP: Record<string, number> = {
 export const POS_COLOR = { r: 235, g: 60, b: 55 };
 export const NEG_COLOR = { r: 50, g: 110, b: 230 };
 
-export const DEEPLIIF_API_URL = "/api/infer";
+export const INFER_API_URL = "/api/infer";
 export const HEALTH_API_URL = "/api/health";
